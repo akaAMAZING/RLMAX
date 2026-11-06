@@ -1,0 +1,17 @@
+[package]
+name = "rlmax"
+description = "RLMAX host library: device context, kernels, buffers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Lead 56: CPU-only per-source impulse capture (src/physics/impulse_log.h); off in every gate and default build
+impulse_log = []
+# test-only: load the suite's full hidden start state (src/cpu/full_state.h); CPU build, off by default
+full_state = []
+
+[build-dependencies]
+cc = "1"
+rlmax-nvcc = { path = "../rlmax-nvcc" }

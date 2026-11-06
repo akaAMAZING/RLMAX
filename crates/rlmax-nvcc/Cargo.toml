@@ -1,0 +1,10 @@
+[package]
+name = "rlmax-nvcc"
+description = "Build-script helper: compiles RLMAX CUDA sources to fat binaries with a pinned nvcc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+cc = "1"

@@ -1,0 +1,16 @@
+# Build output
+**/target/
+
+# Machine-local configuration: data folder, toolkit path
+/.cargo/config.toml
+/.env
+
+# Game assets never enter the repo
+*.cmf
+*.upk
+collision_meshes/
+
+# Editors
+.vscode/
+.idea/
+*.swp
