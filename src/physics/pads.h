@@ -116,7 +116,10 @@ RLMAX_HD bool pad_sweep(const PadDef& pad, V3 from_bt, V3 to_bt, float& enter) {
     const float x = from_bt.x - pad.x * c::UU_TO_BT, y = from_bt.y - pad.y * c::UU_TO_BT;
     const float dx = to_bt.x - from_bt.x, dy = to_bt.y - from_bt.y;
     const float movement2 = dx * dx + dy * dy, projected = x * dx + y * dy, distance = x * x + y * y - radius * radius;
-    if (movement2 < PAD_SWEEP_XY_EPS_BT2) { enter = lo; return distance < 0.0f && lo < hi; }
+    // No sweep without horizontal motion: a car standing (or dropped straight down at a spawn spot) inside the cylinder
+    // takes nothing until it moves; its pad-box overlap is separate. The game's pickups say so: in a recorded game, three
+    // cars still at a spawn spot 174.29 uu from a small pad get it only on the tick something moves them.
+    if (movement2 < PAD_SWEEP_XY_EPS_BT2) { enter = lo; return false; }
     const float disc = projected * projected - movement2 * distance;
     if (disc <= 0.0f) return false;
     const float root = sqrtf(disc);

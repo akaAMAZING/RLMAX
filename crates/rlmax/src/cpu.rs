@@ -188,8 +188,33 @@ unsafe extern "C" {
     #[cfg(feature = "full_state")]
     fn rlmax_fs_block_pads(num_cars: u32, state: *mut u32) -> i32;
     #[cfg(feature = "full_state")]
+    fn rlmax_fs_pads_on(on: i32);
+    #[cfg(feature = "full_state")]
+    fn rlmax_fs_countdown(num_cars: u32, state: *mut u32, phase: u32, fires: u32, count: f32) -> i32;
+    #[cfg(feature = "full_state")]
+    fn rlmax_fs_pad(num_cars: u32, state: *mut u32, pad: u32, cooldown: f32, active: f32, frac_q: f32) -> i32;
+    #[cfg(feature = "full_state")]
+    fn rlmax_fs_car_pad(num_cars: u32, state: *mut u32, car: u32, touching: i32, frame_valid: f32, frame_pos_bt: *const f32) -> i32;
+    #[cfg(feature = "full_state")]
+    fn rlmax_fs_pad_touch(num_cars: u32, state: *const u32, car: u32) -> u32;
+    #[cfg(feature = "full_state")]
+    fn rlmax_fs_pads_taken(num_cars: u32, state: *const u32) -> u64;
+    #[cfg(feature = "full_state")]
     fn rlmax_fs_free(num_cars: u32, state: *mut u32, n: u32, f: *const f32) -> i32;
     fn rlmax_cpu_step(num_cars: u32, states: *mut u32, num_arenas: u32, ticks: u32, arena: *const RawArenaData) -> i32;
+    fn rlmax_states_from_rows(
+        num_cars: u32,
+        num_arenas: u32,
+        ball: *const f32,
+        pads: *const f32,
+        cars: *const f32,
+        team: *const u32,
+        body: *const u32,
+        prev_jump: *const u8,
+        dodge_age: *const f32,
+        arena: *const RawArenaData,
+        out: *mut u32,
+    ) -> i32;
     fn rlmax_extract_row_floats(num_cars: u32) -> u32;
     fn rlmax_extract(num_cars: u32, state: *const u32, out: *mut f32) -> i32;
     fn rlmax_extract_fields(which: i32) -> *const std::ffi::c_char;
@@ -226,6 +251,59 @@ pub(crate) fn staged_words(num_cars: u32) -> u32 { unsafe { rlmax_staged_words(n
 
 pub fn state_words(num_cars: u32) -> u32 {
     unsafe { rlmax_state_words(num_cars) }
+}
+
+/// Floats in one car's row of [`states_from_rows`].
+pub const ROW_CAR_F: usize = 27;
+
+/// Batched replay starts: `n` arenas' state words from the trainer's rows, back to back (`state_words(num_cars)` each,
+/// ready for [`crate::gpu::GpuBatch::write`] or the CPU step). `ball` is `n * 9`, `pads` `n * 34`, `cars` `n * num_cars *
+/// 27` (layout and field meanings in `src/capi/rlmax.h`, rlmax_states_from_rows), `team`, `body` and `prev_jump` `n * num_cars`.
+/// `dodge_age`, if given, `n * num_cars`: seconds since each car's dodge began (its dodge tick included), negative for none.
+#[allow(clippy::too_many_arguments)]
+pub fn states_from_rows(
+    arena: &ArenaData,
+    num_cars: u32,
+    ball: &[f32],
+    pads: &[f32],
+    cars: &[f32],
+    team: &[u32],
+    body: &[u32],
+    prev_jump: &[u8],
+    dodge_age: Option<&[f32]>,
+) -> Vec<u32> {
+    let w = state_words(num_cars) as usize;
+    assert!(w > 0, "unsupported car count {num_cars}");
+    let nc = num_cars as usize;
+    let n = ball.len() / 9;
+    assert_eq!(ball.len(), n * 9);
+    assert_eq!(pads.len(), n * 34);
+    assert_eq!(cars.len(), n * nc * ROW_CAR_F);
+    assert_eq!(team.len(), n * nc);
+    assert_eq!(body.len(), n * nc);
+    assert_eq!(prev_jump.len(), n * nc);
+    if let Some(d) = dodge_age {
+        assert_eq!(d.len(), n * nc);
+    }
+    let mut out = vec![0u32; n * w];
+    let raw = arena.raw();
+    let rc = unsafe {
+        rlmax_states_from_rows(
+            num_cars,
+            n as u32,
+            ball.as_ptr(),
+            pads.as_ptr(),
+            cars.as_ptr(),
+            team.as_ptr(),
+            body.as_ptr(),
+            prev_jump.as_ptr(),
+            dodge_age.map_or(std::ptr::null(), |d| d.as_ptr()),
+            &raw,
+            out.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rc, 0);
+    out
 }
 
 /// Grid parameters. A cell lists every triangle within reach of any point in it, so a smaller cell and a shorter reach
@@ -407,6 +485,13 @@ impl Arena {
         a
     }
 
+    /// One arena from the trainer's rows (see [`states_from_rows`]): `ball` 9, `pads` 34, `cars` `num_cars * 27`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_rows(arena: &ArenaData, ball: &[f32], pads: &[f32], cars: &[f32], team: &[u32], body: &[u32], prev_jump: &[u8], dodge_age: Option<&[f32]>) -> Arena {
+        let num_cars = team.len() as u32;
+        Arena::from_words(num_cars, &states_from_rows(arena, num_cars, ball, pads, cars, team, body, prev_jump, dodge_age))
+    }
+
     /// Test-only (feature `full_state`): car `i`'s recorded body block of 28 floats, in Bullet units: pos, vel, ang vel,
     /// basis columns forward/right/up, inverse inertia rows, valid flag. Call after `set_car`.
     #[cfg(feature = "full_state")]
@@ -440,6 +525,47 @@ impl Arena {
     #[cfg(feature = "full_state")]
     pub fn fs_block_pads(&mut self) {
         unsafe { rlmax_fs_block_pads(self.num_cars, self.words.as_mut_ptr()) };
+    }
+
+    /// Test-only: run the arena's own boost pads (thread-wide; off by default in the test build, whose boost comes from recorded pickups).
+    #[cfg(feature = "full_state")]
+    pub fn fs_pads_on(on: bool) {
+        unsafe { rlmax_fs_pads_on(on as i32) };
+    }
+
+    /// Test-only: pad `p`'s (RLMAX's order) recorded cooldown in seconds, whether active, and quantised pickup fraction. Call after
+    /// `fs_car_extra` (it sets the arena tick the pad's pickup tick counts from). Returns 0, or non-zero if the pad can't be placed.
+    #[cfg(feature = "full_state")]
+    pub fn fs_pad(&mut self, p: u32, cooldown: f32, active: bool, frac_q: u16) -> i32 {
+        unsafe { rlmax_fs_pad(self.num_cars, self.words.as_mut_ptr(), p, cooldown, active as u32 as f32, frac_q as f32) }
+    }
+
+    /// Test-only: the game's round countdown at the start: phase (0 none, 1 first second, 2 the three fires), fires so far and the float
+    /// counter. Every car is undriven until the countdown ends; set the frame fraction first, it sets what each tick adds.
+    #[cfg(feature = "full_state")]
+    pub fn fs_countdown(&mut self, phase: u32, fires: u32, count: f32) -> i32 {
+        unsafe { rlmax_fs_countdown(self.num_cars, self.words.as_mut_ptr(), phase, fires, count) }
+    }
+
+    /// Test-only: car `i`'s recorded pad state: the pad it touches (RLMAX's order) and its last render-frame end position, Bullet units.
+    #[cfg(feature = "full_state")]
+    pub fn fs_car_pad(&mut self, i: u32, touching: Option<u32>, frame_pos_bt: Option<[f32; 3]>) -> i32 {
+        let pos = frame_pos_bt.unwrap_or([0.0; 3]);
+        unsafe {
+            rlmax_fs_car_pad(self.num_cars, self.words.as_mut_ptr(), i, touching.map_or(-1, |p| p as i32), frame_pos_bt.is_some() as u32 as f32, pos.as_ptr())
+        }
+    }
+
+    /// Test-only: the pad car `i` touches (RLMAX's index, `u32::MAX` none).
+    #[cfg(feature = "full_state")]
+    pub fn fs_pad_touch(&self, i: u32) -> u32 {
+        unsafe { rlmax_fs_pad_touch(self.num_cars, self.words.as_ptr(), i) }
+    }
+
+    /// Test-only: the pads holding a pickup, bit `p` for RLMAX's pad `p`.
+    #[cfg(feature = "full_state")]
+    pub fn fs_pads_taken(&self) -> u64 {
+        unsafe { rlmax_fs_pads_taken(self.num_cars, self.words.as_ptr()) }
     }
 
     /// The state words, to carry the arena to and from the card.
@@ -785,7 +911,7 @@ pub fn parity_arenas(num_cars: u32, n: usize) -> Vec<Arena> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -882,7 +1008,6 @@ mod tests {
             assert_eq!(c.preset, preset, "preset {preset}: changed by the respawn");
         }
     }
-
 
     /// A kickoff is a rest state: idle for 120 ticks, every car (both teams, all five spots, every preset) stays where it
     /// started to within `TOL_UU` / `TOL_VEL` / `TOL_ANG`, and the rest heights equal the recordings'.
@@ -982,7 +1107,7 @@ mod tests {
             eprintln!("no meshes; skipped");
             return;
         };
-        for n in [3u32, 5, 8] {
+        for n in [3u32, 5, 7, 8] {
             let mut a = Arena::new(n);
             for i in 0..n {
                 let mut c = a.car(i);
@@ -1033,5 +1158,268 @@ mod tests {
         eprintln!("min z {min_z}, bounced {bounced}");
         assert!(bounced);
         assert!(min_z > 80.0 && min_z < 95.0, "ball penetrated or floated: {min_z}");
+    }
+
+    pub(crate) type Rows = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>, Vec<u32>);
+
+    /// Rows for `n` 2-car arenas: scattered poses; cars on the ground, jumped with the dodge available, dodged, double
+    /// jumped; one demoed; pad timers at whole ticks.
+    pub(crate) fn sample_rows(n: usize) -> Rows {
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let (mut ball, mut pads, mut cars, mut team, mut body) = (vec![], vec![], vec![], vec![], vec![]);
+        for a in 0..n {
+            ball.extend([rnd() * 2000.0 - 1000.0, rnd() * 3000.0 - 1500.0, 200.0 + rnd() * 600.0]);
+            ball.extend([rnd() * 2000.0 - 1000.0, rnd() * 2000.0 - 1000.0, rnd() * 800.0 - 400.0]);
+            ball.extend([rnd() * 6.0 - 3.0, rnd() * 6.0 - 3.0, rnd() * 6.0 - 3.0]);
+            for p in 0..34 {
+                let cd_ticks: u32 = if [3, 4, 15, 18, 29, 30].contains(&p) { 1200 } else { 480 };
+                pads.push(if (p + a) % 3 == 0 { 0.0 } else { (2 + (rnd() * (cd_ticks - 4) as f32) as u32) as f32 / 120.0 });
+            }
+            for c in 0..2 {
+                let (yaw, pitch, roll) = (rnd() * std::f32::consts::TAU, rnd() * 0.6 - 0.3, rnd() * 0.6 - 0.3);
+                let (sy, cy, sp, cp, sr, cr) = (yaw.sin(), yaw.cos(), pitch.sin(), pitch.cos(), roll.sin(), roll.cos());
+                let fwd = [cp * cy, cp * sy, sp];
+                let up0 = [-sp * cy, -sp * sy, cp];
+                let right0 = [up0[1] * fwd[2] - up0[2] * fwd[1], up0[2] * fwd[0] - up0[0] * fwd[2], up0[0] * fwd[1] - up0[1] * fwd[0]];
+                let up = [up0[0] * cr - right0[0] * sr, up0[1] * cr - right0[1] * sr, up0[2] * cr - right0[2] * sr];
+                let kind = (a + c) % 4; // 0 ground, 1 jumped (dodge available), 2 dodged, 3 double jumped
+                let ground = kind == 0;
+                let air = if ground { 0.0 } else { 0.1 + rnd() * 0.9 };
+                let (has_jump, has_flip, flip_time, flip_dir) = match kind {
+                    0 => (1.0, 1.0, 0.8 + rnd(), [0.0, 0.0]),
+                    1 => (0.0, 1.0, 5.0 + rnd(), [0.0, 0.0]),
+                    2 => (0.0, 0.0, air * 0.5, [-1.0, 0.0]),
+                    _ => (0.0, 0.0, 5.0 + rnd(), [0.0, 0.0]),
+                };
+                cars.extend([rnd() * 4000.0 - 2000.0, rnd() * 4000.0 - 2000.0, if ground { 17.0 } else { 300.0 + rnd() * 500.0 }]);
+                cars.extend([rnd() * 1800.0 - 900.0, rnd() * 1800.0 - 900.0, rnd() * 400.0 - 200.0]);
+                cars.extend([rnd() * 4.0 - 2.0, rnd() * 4.0 - 2.0, rnd() * 4.0 - 2.0]);
+                cars.extend(fwd);
+                cars.extend(up);
+                let demo = if a % 5 == 0 && c == 1 { 1.5 } else { 0.0 };
+                let jump_time = if ground { 0.0 } else { 12.0 / 120.0 };
+                cars.extend([rnd(), ground as u32 as f32, has_jump, has_flip, demo, jump_time, flip_time, air, rnd() * 3.0, rnd()]);
+                cars.extend(flip_dir);
+                team.push(c as u32);
+                body.push(((a + c) % 6) as u32);
+            }
+        }
+        (ball, pads, cars, team, body)
+    }
+
+    #[test]
+    fn rows_round_trip_through_extract() {
+        let Ok(arena) = ArenaData::soccar_from_env() else {
+            eprintln!("no meshes; skipped");
+            return;
+        };
+        let n = 48;
+        let (ball, pads, cars, team, body) = sample_rows(n);
+        let words = states_from_rows(&arena, 2, &ball, &pads, &cars, &team, &body, &vec![0u8; n * 2], None);
+        let w = state_words(2) as usize;
+        assert_eq!(words.len(), n * w);
+        let f = extract_fields(2);
+        let (mut worst_dir, mut worst_pad, mut worst_boost) = (0.0f32, 0.0f32, 0.0f32);
+        let near = |got: f32, want: f32| (got - want).abs() <= want.abs() * 1.3e-7 + 1e-7;
+        for a in 0..n {
+            let st = Arena::from_words(2, &words[a * w..(a + 1) * w]);
+            assert_eq!(st.tick_count(), 0);
+            let row = st.extract();
+            let at = |name: &str| row[f.iter().position(|x| x == name).unwrap()];
+            let ball_names = ["ball_pos_x", "ball_pos_y", "ball_pos_z", "ball_vel_x", "ball_vel_y", "ball_vel_z", "ball_ang_x", "ball_ang_y", "ball_ang_z"];
+            for (k, name) in ball_names.iter().enumerate() {
+                let (got, want) = (at(name), ball[a * 9 + k]);
+                if k < 6 {
+                    assert!(near(got, want), "{name}: {got} vs {want}");
+                } else {
+                    assert_eq!(got, want, "{name}");
+                }
+            }
+            for p in 0..34 {
+                worst_pad = worst_pad.max((at(&format!("pad_{p}")) - pads[a * 34 + p]).abs());
+            }
+            for c in 0..2 {
+                let r = &cars[(a * 2 + c) * 27..(a * 2 + c + 1) * 27];
+                let g = |nm: &str| at(&format!("car{c}_{nm}"));
+                for (k, name) in ["pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z"].iter().enumerate() {
+                    assert!(near(g(name), r[k]), "car{c} {name}: {} vs {}", g(name), r[k]);
+                }
+                for (k, name) in ["ang_x", "ang_y", "ang_z"].iter().enumerate() {
+                    assert_eq!(g(name), r[6 + k], "car{c} {name}");
+                }
+                for (k, name) in ["fwd_x", "fwd_y", "fwd_z", "up_x", "up_y", "up_z"].iter().enumerate() {
+                    worst_dir = worst_dir.max((g(name) - r[9 + k]).abs());
+                }
+                worst_boost = worst_boost.max((g("boost") / 100.0 - r[15]).abs());
+                assert_eq!(g("on_ground"), r[16]);
+                // obs.py / layout.py: has_jump = on_ground | !has_jumped; has_flip = on_ground | (!double & !flipped & air < 1.25)
+                let ground = r[16] > 0.5;
+                let has_jump = ground || g("has_jumped") < 0.5;
+                let has_flip = ground || (g("has_double_jumped") < 0.5 && g("has_flipped") < 0.5 && g("time_since_jump") < 1.25);
+                assert_eq!(has_jump as u32 as f32, r[17], "car{c} has_jump");
+                assert_eq!(has_flip as u32 as f32, r[18], "car{c} has_flip");
+                assert_eq!(g("demo_respawn_time"), r[19]);
+                assert_eq!(g("is_demoed"), (r[19] > 0.0) as u32 as f32);
+                assert!((g("jump_time") - r[20]).abs() < 1e-6);
+                assert_eq!(g("flip_time"), r[21]);
+                // mapping: the row's air time is the airborne car's time_since_jump and air_time; a grounded car is armed
+                if ground {
+                    assert!(g("time_since_jump") >= 0.125, "car{c} grounded time_since_jump {}", g("time_since_jump"));
+                    assert_eq!(g("air_time"), 0.0);
+                } else {
+                    assert_eq!(g("time_since_jump"), r[22]);
+                    assert_eq!(g("air_time"), r[22]);
+                }
+                assert_eq!(g("time_since_boosted"), r[23]);
+                assert_eq!(g("handbrake"), r[24]);
+                assert_eq!(g("flip_torque_x"), r[25]);
+                assert_eq!(g("flip_torque_y"), r[26]);
+                assert_eq!(g("team"), team[a * 2 + c] as f32);
+                assert_eq!(g("body"), body[a * 2 + c] as f32);
+                for ctl in ["ctl_throttle", "ctl_steer", "ctl_pitch", "ctl_yaw", "ctl_roll", "ctl_jump", "ctl_boost", "ctl_handbrake"] {
+                    assert_eq!(g(ctl), 0.0, "{ctl}");
+                }
+            }
+        }
+        eprintln!("fwd/up worst abs error {worst_dir:.3e}, pad worst abs error {worst_pad:.3e} s, boost {worst_boost:.3e}");
+        assert!(worst_dir < 2e-6, "{worst_dir}");
+        assert!(worst_pad <= 0.5 / 120.0 + 1e-6, "{worst_pad}");
+        assert!(worst_boost < 1e-6, "{worst_boost}");
+        // the single-arena wrapper agrees with the batch
+        let one = Arena::from_rows(&arena, &ball[..9], &pads[..34], &cars[..54], &team[..2], &body[..2], &[0, 0], None);
+        assert_eq!(one.words(), &words[..w]);
+    }
+
+    /// Real dodges, stepped tick by tick: each tick's state goes to a row and back, and the flip flags
+    /// it recovers are compared with the truth. A finished dodge must never come back flipping; a running one must, whenever
+    /// it began within the torque time of the jump.
+    #[test]
+    fn dodge_flags_recovered_from_rows() {
+        let Ok(arena) = ArenaData::soccar_from_env() else {
+            eprintln!("no meshes; skipped");
+            return;
+        };
+        let f = extract_fields(2);
+        let dodge_ticks = [1u32, 2, 10, 40, 70, 76, 77, 78, 79, 100, 140];
+        let (mut flipping, mut finished, mut missed) = (0u32, 0u32, 0u32);
+        // first jump: already used (airtime counts from the start), or none (a dodge after driving off a ledge)
+        for jumped in [true, false] {
+            for &at in &dodge_ticks {
+                let ball = BallState {
+                    body: BodyState { pos: [0.0, 0.0, 1500.0], rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], ..Default::default() },
+                    ..Default::default()
+                };
+                let mut car = CarState::default();
+                car.body.rot = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+                car.body.pos = [0.0, -1000.0, 1000.0];
+                car.body.vel = [0.0, 0.0, 600.0];
+                car.flags = if jumped { flags::HAS_JUMPED } else { 0 };
+                let mut other = car;
+                other.body.pos = [0.0, 1000.0, 1000.0];
+                other.team = 1;
+                let mut a = Arena::from_physical(&arena, &ball, &[car, other]);
+                for t in 0..320u32 {
+                    let press = t == at;
+                    a.set_controls(0, &Controls { pitch: if press { -1.0 } else { 0.0 }, jump: press as u32, ..Default::default() });
+                    a.step(&arena, 1);
+                    let row = a.extract();
+                    let at_f = |n: &str| row[f.iter().position(|x| x == n).unwrap()];
+                    let g = |n: &str| at_f(&format!("car0_{n}"));
+                    if g("on_ground") > 0.5 {
+                        break;
+                    }
+                    // the row, as layout.py builds it
+                    let mut cars = vec![0.0f32; 54];
+                    let names = ["pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z", "ang_x", "ang_y", "ang_z", "fwd_x", "fwd_y", "fwd_z", "up_x", "up_y", "up_z"];
+                    for c in 0..2 {
+                        let h = |n: &str| at_f(&format!("car{c}_{n}"));
+                        for (k, n) in names.iter().enumerate() {
+                            cars[c * 27 + k] = h(n);
+                        }
+                        cars[c * 27 + 15] = h("boost") / 100.0;
+                        cars[c * 27 + 16] = h("on_ground");
+                        cars[c * 27 + 17] = (h("on_ground") > 0.5 || h("has_jumped") < 0.5) as u32 as f32;
+                        let open = h("has_double_jumped") < 0.5 && h("has_flipped") < 0.5 && h("time_since_jump") < 1.25;
+                        cars[c * 27 + 18] = (h("on_ground") > 0.5 || open) as u32 as f32;
+                        cars[c * 27 + 19] = h("demo_respawn_time");
+                        cars[c * 27 + 20] = h("jump_time");
+                        cars[c * 27 + 21] = h("flip_time");
+                        cars[c * 27 + 22] = h("time_since_jump");
+                        cars[c * 27 + 23] = h("time_since_boosted");
+                        cars[c * 27 + 24] = h("handbrake");
+                        cars[c * 27 + 25] = h("flip_torque_x");
+                        cars[c * 27 + 26] = h("flip_torque_y");
+                    }
+                    let back = Arena::from_rows(&arena, &[0.0, 0.0, 1500.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &[0.0; 34], &cars, &[0, 1], &[0, 0], &[0, 0], None);
+                    let got = back.extract();
+                    let got_flipping = got[f.iter().position(|x| x == "car0_is_flipping").unwrap()] > 0.5;
+                    let truth = g("is_flipping") > 0.5;
+                    if g("has_flipped") > 0.5 && !truth {
+                        assert!(!got_flipping, "finished dodge restarted: jumped {jumped}, dodge tick {at}, t {t}");
+                        finished += 1;
+                    }
+                    if truth {
+                        flipping += 1;
+                        // air at the dodge: time_since_jump counts from tick 0 in both cases (the car never held the jump button)
+                        let late = at + 1 >= 78;
+                        if !got_flipping {
+                            assert!(late, "running dodge lost: jumped {jumped}, dodge tick {at}, t {t}");
+                            missed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("running dodge ticks {flipping}, of which read as finished (late dodges) {missed}; finished dodge ticks {finished}");
+        assert!(flipping > 0 && finished > 0);
+    }
+
+    /// A held jump button is no new press: with prev_jump the airborne car keeps its second jump, without it the button is a
+    /// press and spends it.
+    #[test]
+    fn prev_jump_is_no_new_press() {
+        let Ok(arena) = ArenaData::soccar_from_env() else {
+            eprintln!("no meshes; skipped");
+            return;
+        };
+        let (ball, pads, mut cars, team, body) = sample_rows(1);
+        for c in 0..2 {
+            let r = &mut cars[c * 27..(c + 1) * 27];
+            r[0..3].copy_from_slice(&[0.0, if c == 0 { -1000.0 } else { 1000.0 }, 1000.0]);
+            r[16] = 0.0; // off the ground, the first jump used, the dodge open
+            r[17] = 0.0;
+            r[18] = 1.0;
+            r[19] = 0.0;
+            r[22] = 0.3;
+        }
+        let spent = |prev: u8| {
+            let mut a = Arena::from_rows(&arena, &ball, &pads, &cars, &team, &body, &[prev, 0], None);
+            assert_eq!(a.car(0).flags & flags::PREV_JUMP != 0, prev != 0);
+            a.set_controls(0, &Controls { jump: 1, ..Default::default() });
+            a.step(&arena, 1);
+            a.car(0).flags & flags::HAS_DOUBLE_JUMPED != 0
+        };
+        assert!(spent(0), "a fresh press spends the second jump");
+        assert!(!spent(1), "a held button doesn't");
+    }
+
+    #[test]
+    fn built_arena_steps_bit_identical() {
+        let Ok(arena) = ArenaData::soccar_from_env() else {
+            eprintln!("no meshes; skipped");
+            return;
+        };
+        let (ball, pads, cars, team, body) = sample_rows(4);
+        let run = || {
+            let mut a = Arena::from_rows(&arena, &ball[..9], &pads[..34], &cars[..54], &team[..2], &body[..2], &[0, 0], None);
+            a.step(&arena, 120);
+            assert_eq!(a.tick_count(), 120);
+            a.words().to_vec()
+        };
+        assert_eq!(run(), run());
     }
 }

@@ -128,6 +128,26 @@ int rlmax_refresh_sticky_gate_with_wheels(uint32_t num_cars, uint32_t* state, ui
 int rlmax_seed_wheel_contacts(uint32_t num_cars, uint32_t* state, uint32_t car, uint32_t wheel_mask, const float* normals,
                               const RlmaxArenaData* arena);
 
+/* Batched replay starts, CPU side: `num_arenas` states from the trainer's rows, written back to back
+ * to `out` (`num_arenas` x `rlmax_state_words(num_cars)` words), ready for GpuBatch::write or rlmax_cpu_step. Inputs, arena-major:
+ *   ball  [num_arenas][9]: pos (uu), vel (uu/s), ang_vel (rad/s)
+ *   pads  [num_arenas][34]: seconds until active (pads.h order); 0 = active; rounded to the nearest tick
+ *   cars  [num_arenas][num_cars][27]: pos 3, vel 3, ang 3, fwd 3, up 3, boost (0..1), on_ground, has_jump, has_flip,
+ *         demo_timer, jump_time, flip_time, air_time, boost_time, handbrake, flip_dir 2 (times in seconds)
+ *   team  [num_arenas][num_cars] (0 blue, 1 orange), body [num_arenas][num_cars] (BodyPresetId: 0 Octane, 1 Dominus, 2 Plank,
+ *         3 Breakout, 4 Hybrid, 5 Merc), prev_jump [num_arenas][num_cars] (the jump button on the tick before: a held button is
+ *         then no new press)
+ * Tick 0, controls zero, ball sleeping 3, manifolds/sweep/pad touches fresh, each car's sticky gate rebuilt from its wheel
+ * rays (rlmax_refresh_sticky_gate) after every body is placed. Rotation: basis (fwd, up x fwd, up) through Bullet's getRotation
+ * and normalise, as rlmax_set_car. An airborne car's air_time and time_since_jump both take the row's air time; a grounded
+ * car's time_since_jump is the jump re-arm time. A grounded car with jump held, its jump timer within the hold limit and
+ * the jump's impulse along up is mid-jump. `dodge_age` may be null; else per car the seconds since its dodge began, the dodge
+ * tick included (negative: none): the car has flipped, and an airborne one is flipping while flip_time still counts from that
+ * dodge. Returns 0, or -1 for an unsupported car count. */
+int rlmax_states_from_rows(uint32_t num_cars, uint32_t num_arenas, const float* ball, const float* pads, const float* cars,
+                           const uint32_t* team, const uint32_t* body, const uint8_t* prev_jump, const float* dodge_age,
+                           const RlmaxArenaData* arena, uint32_t* out);
+
 /* CPU build: step `num_arenas` contiguous arena states (array of structures) by `ticks` ticks. */
 int rlmax_cpu_step(uint32_t num_cars, uint32_t* states, uint32_t num_arenas, uint32_t ticks, const RlmaxArenaData* arena);
 

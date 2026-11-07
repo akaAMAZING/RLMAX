@@ -18,6 +18,75 @@ int rlmax_fs_block_pads(uint32_t nc, uint32_t* state) {
         return 0;
     });
 }
+// Controls-only runs start from the game's pad state. Pad `p` (RLMAX's pad_def order): the game's remaining cooldown in seconds, whether it
+// is active, and its quantised pickup fraction. The game's cooldown is decremented before each tick's respawn test, which fires when the
+// remaining ticks, rounded, are below zero, or zero with the pickup fraction under the frame's; pads_update's age test is the same with
+// age = period - remaining at the tick that starts from here, so the pad gave `period - remaining` ticks before the arena's tick. Call after
+// rlmax_fs_car_extra (which sets that tick). The game's cur/prev locked car ids have no home: pads_update locks within a tick, and the game
+// clears cur_locked at the start of the next one, so neither is read across the boundary.
+int rlmax_fs_pad(uint32_t nc, uint32_t* state, uint32_t p, float cooldown, float active, float frac_q) {
+    if (p >= (uint32_t)NUM_PADS) return -1;
+    return with_nc(nc, [&](auto k) {
+        constexpr int NC = decltype(k)::value;
+        auto* a = reinterpret_cast<ArenaState<NC>*>(state);
+        a->pad_pickup_frac[p] = (uint16_t)frac_q;
+        if (active != 0.0f && !(cooldown > 0.0f)) { a->pad_gave_tick[p] = PAD_NONE; return 0; }
+        const uint32_t period = pad_def((int)p).big ? PAD_COOLDOWN_BIG_TICKS : PAD_COOLDOWN_SMALL_TICKS;
+        // the recordings mark a pad that never respawns with a cooldown of 1e9 s; the arena counts at most one period, which outlasts a segment
+        const uint32_t remaining = (uint32_t)(int32_t)fminf(floorf(cooldown / c::DT + 0.5f), (float)period);
+        const uint32_t gave = a->tick - period + remaining;
+        if (gave == PAD_NONE) return -3;  // the "never" word: this pad would read as active
+        a->pad_gave_tick[p] = gave;
+        return 0;
+    });
+}
+// The game's round countdown at the start state: phase (0 none, 1 first second, 2 the three fires), fires so far, and its float counter
+// (EnvState.countdown_phase, countdown_fires, countdown_count). The recorded frame fraction (rlmax_set_pad_frame_fraction) is what each
+// tick adds to the counter. Phase 0 clears it.
+int rlmax_fs_countdown(uint32_t nc, uint32_t* state, uint32_t phase, uint32_t fires, float count) {
+    if (phase > 2 || fires > 2 || !isfinite(count)) return -1;
+    return with_nc(nc, [&](auto k) {
+        constexpr int NC = decltype(k)::value;
+        auto* a = reinterpret_cast<ArenaState<NC>*>(state);
+        a->countdown = phase ? countdown_word(phase, fires) : 0u;
+        a->countdown_count = phase ? count : 0.0f;
+        return 0;
+    });
+}
+// car `ci`'s pad state: the pad it touches (RLMAX's index, or -1 none), and the last render-frame end position when the game holds one.
+// Clears the car's cached pad cell, and slot 0's expiry deadline, which the next step recomputes.
+int rlmax_fs_car_pad(uint32_t nc, uint32_t* state, uint32_t ci, int32_t touching, float frame_valid, const float* frame_pos_bt) {
+    if (ci >= nc) return -1;
+    return with_nc(nc, [&](auto k) {
+        constexpr int NC = decltype(k)::value;
+        CarState& cs = reinterpret_cast<ArenaState<NC>*>(state)->cars[ci];
+        cs.pad_touch = touching < 0 ? PAD_NONE : (uint32_t)touching;
+        cs.pad_frame_valid = frame_valid != 0.0f ? 1u : 0u;
+        cs.pad_frame_pos = fs_v3(frame_pos_bt);
+        return 0;
+    });
+}
+// car `ci`'s pad_touch (RLMAX's pad index, 0xFFFFFFFF none), for diagnosis
+uint32_t rlmax_fs_pad_touch(uint32_t nc, const uint32_t* state, uint32_t ci) {
+    uint32_t t = PAD_NONE;
+    with_nc(nc, [&](auto k) {
+        constexpr int NC = decltype(k)::value;
+        if (ci < (uint32_t)NC) t = reinterpret_cast<const ArenaState<NC>*>(state)->cars[ci].pad_touch;
+        return 0;
+    });
+    return t;
+}
+// the pads holding a pickup (gave a boost and not yet respawned), bit p = RLMAX's pad p
+uint64_t rlmax_fs_pads_taken(uint32_t nc, const uint32_t* state) {
+    uint64_t m = 0;
+    with_nc(nc, [&](auto k) {
+        constexpr int NC = decltype(k)::value;
+        const auto* a = reinterpret_cast<const ArenaState<NC>*>(state);
+        for (int p = 0; p < NUM_PADS; p++) m |= (uint64_t)(a->pad_gave_tick[p] != PAD_NONE) << p;
+        return 0;
+    });
+    return m;
+}
 // the game's own jump state: jumped, and the time since the car last jumped
 int rlmax_fs_jump(uint32_t nc, uint32_t* state, uint32_t ci, float jumped, float used, float inactive, float ground) {
     if (ci >= nc) return -1;
@@ -31,6 +100,8 @@ int rlmax_fs_jump(uint32_t nc, uint32_t* state, uint32_t ci, float jumped, float
         return 0;
     });
 }
+// the arena runs its own boost pads (controls-only recordings; the default of the test build is none, the credits come from the recording)
+void rlmax_fs_pads_on(int on) { g_fs_pads = on != 0; }
 void rlmax_fs_spawn_z(uint32_t ci, float z) { if (ci < 8) g_fs_spawn_z[ci] = z; }
 int rlmax_seed_handle(uint32_t nc, uint32_t* state, uint32_t body, uint32_t handle) {
     return with_nc(nc, [&](auto k) {
@@ -131,7 +202,7 @@ int rlmax_fs_visit(uint32_t nc, uint32_t* state, uint32_t packed, uint32_t prese
         for (int q = 0; q < 8; q++) {
             const uint32_t slot = packed >> (4 * q) & 15u;
             if (slot >= (uint32_t)NC) continue;
-            v |= (slot ^ (uint32_t)n) << ((NC == 8 ? 3 : 4) * n++);
+            v |= (slot ^ (uint32_t)n) << (visit_bits<NC>() * n++);
             off |= (present >> slot & 1u ? 0u : 1u) << slot;
         }
         reinterpret_cast<ArenaState<NC>*>(state)->visit = v | off << 24;

@@ -32,19 +32,20 @@ RLMAX_HD uint8_t sw_key(int a, int b) {
 RLMAX_HD int sw_lo(int k) { return k % SW_KEY_STRIDE; }
 RLMAX_HD int sw_hi(int k) { return SW_BALL + k / SW_KEY_STRIDE; }
 
-// Eight cars need handles through 31; retain the original byte key for smaller batches.
+// Seven and eight cars need handles through 30 and 31 (the stride-29 byte key reaches only 28): stride 31. Seven cars'
+// largest key is 6 * 31 + 29 = 215, so their key stays a byte; eight cars' keys are 16 bits (SweepKey).
 template <int NC> RLMAX_HD SweepKey<NC> sw_key_for(int a, int b) {
-    if constexpr (NC == 8) {
+    if constexpr (NC >= 7) {
         const int lo = a < b ? a : b, hi = a < b ? b : a;
         return (SweepKey<NC>)((hi - SW_BALL) * 31 + lo);
     } else return sw_key(a, b);
 }
 template <int NC> RLMAX_HD int sw_lo_for(SweepKey<NC> k) {
-    if constexpr (NC == 8) return k % 31;
+    if constexpr (NC >= 7) return k % 31;
     else return sw_lo(k);
 }
 template <int NC> RLMAX_HD int sw_hi_for(SweepKey<NC> k) {
-    if constexpr (NC == 8) return SW_BALL + k / 31;
+    if constexpr (NC >= 7) return SW_BALL + k / 31;
     else return sw_hi(k);
 }
 
@@ -192,7 +193,7 @@ struct Sweep : SweepStorage<NC, SlotOnly> {
     static constexpr int NE = 2 * NH + 2;       // edges per axis with the two sentinels
     static constexpr int CAP = sweep_man_cap<NC>();
     static constexpr int PAIR_CAP = sweep_cap<NC>();
-    static_assert(NH <= (NC == 8 ? 31 : SW_KEY_STRIDE), "pair key stride");
+    static_assert(NH <= (NC >= 7 ? 31 : SW_KEY_STRIDE), "pair key stride");
 
     // a fresh sweep's lists; a valid sweep's slot form keeps dynamic edge d's place in hnd[axis][d] and its position in
     // pos[axis][d] (the lists are not built there, so the frame holds one of the two)

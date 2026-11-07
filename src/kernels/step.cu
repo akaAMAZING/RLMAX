@@ -34,6 +34,7 @@ extern "C" __global__ void rlmax_prof_read(unsigned long long* out) {
 #define RLMAX_SM86_REGS_4 255
 #define RLMAX_SM86_REGS_5 255
 #define RLMAX_SM86_REGS_6 255
+#define RLMAX_SM86_REGS_7 255
 #define RLMAX_SM86_REGS_8 255
 #endif
 #if defined(RLMAX_REGS_2)
@@ -72,6 +73,13 @@ extern "C" __global__ void rlmax_prof_read(unsigned long long* out) {
 #define RLMAX_TICK_BOUNDS_6 __launch_bounds__(128)
 #endif
 
+#if defined(RLMAX_REGS_7)
+#define RLMAX_TICK_BOUNDS_7 __maxnreg__(RLMAX_REGS_7)
+#elif defined(RLMAX_SM86_REGS_7)
+#define RLMAX_TICK_BOUNDS_7 __maxnreg__(RLMAX_SM86_REGS_7)
+#else
+#define RLMAX_TICK_BOUNDS_7 __launch_bounds__(128)
+#endif
 #if defined(RLMAX_REGS_8)
 #define RLMAX_TICK_BOUNDS_8 __maxnreg__(RLMAX_REGS_8)
 #elif defined(RLMAX_SM86_REGS_8)
@@ -80,52 +88,11 @@ extern "C" __global__ void rlmax_prof_read(unsigned long long* out) {
 #define RLMAX_TICK_BOUNDS_8 __launch_bounds__(128)
 #endif
 
-template <int NC, bool HasPsyclops = false>
-__device__ __forceinline__ void step_arenas(uint32_t* states, uint32_t n, uint32_t ticks, const ArenaData& ad) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    ArenaState<NC>* a = reinterpret_cast<ArenaState<NC>*>(states) + i;
-    EpaScratch scratch;
-    GeoCache<NC> gc;  // the cars' geometry derived once per launch, not per tick (tick.h)
-    gc.reset();
-    for (uint32_t t = 0; t < ticks; t++) tick<NC, HasPsyclops>(*a, ad, scratch, gc);
-}
-
-extern "C" __global__ void RLMAX_TICK_BOUNDS_2 rlmax_step_2(uint32_t* states, uint32_t n, uint32_t ticks, ArenaData ad) {
-    step_arenas<2>(states, n, ticks, ad);
-}
-extern "C" __global__ void RLMAX_TICK_BOUNDS_3 rlmax_step_3(uint32_t* states, uint32_t n, uint32_t ticks, ArenaData ad) {
-    step_arenas<3>(states, n, ticks, ad);
-}
-extern "C" __global__ void RLMAX_TICK_BOUNDS_4 rlmax_step_4(uint32_t* states, uint32_t n, uint32_t ticks, ArenaData ad) {
-    step_arenas<4>(states, n, ticks, ad);
-}
-extern "C" __global__ void RLMAX_TICK_BOUNDS_5 rlmax_step_5(uint32_t* states, uint32_t n, uint32_t ticks, ArenaData ad) {
-    step_arenas<5>(states, n, ticks, ad);
-}
-extern "C" __global__ void RLMAX_TICK_BOUNDS_6 rlmax_step_6(uint32_t* states, uint32_t n, uint32_t ticks, ArenaData ad) {
-    step_arenas<6>(states, n, ticks, ad);
-}
-
-extern "C" __global__ void RLMAX_TICK_BOUNDS_8 rlmax_step_8(uint32_t* states, uint32_t n, uint32_t ticks, ArenaData ad) {
-    step_arenas<8>(states, n, ticks, ad);
-}
-
-// One decision for every arena, the trainer's step: an arena whose last decision scored is reset to a kickoff first
-// (the goal reset at the decision boundary, counted in `goals`), then each car's action row (one byte per car) is
-// looked up in the action table (8 floats a row: throttle, steer, pitch, yaw, roll, jump, boost, handbrake) and `ticks`
-// ticks run. Without rows (null) the table holds one row per car, arena-major: raw controls, for action spaces past
-// 256 rows (evaluation of other bots); the same floats give the same physics.
-template <int NC, bool HasPsyclops = false>
-__device__ __forceinline__ void decide_arenas(uint32_t* states, uint32_t n, uint32_t ticks, const ArenaData& ad,
-                                              const uint8_t* rows, const float* table, uint32_t* goals) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    ArenaState<NC>* a = reinterpret_cast<ArenaState<NC>*>(states) + i;
-    if (a->events & 3u) {
-        kickoff_reset<NC>(*a);
-        goals[i] += 1;
-    }
+// Each car's action row (one byte per car, arena-major) looked up in the action table (8 floats a row: throttle, steer,
+// pitch, yaw, roll, jump, boost, handbrake). Without rows (null) the table holds one row per car, arena-major: raw
+// controls, for action spaces past 256 rows (evaluation of other bots); the same floats give the same physics.
+template <int NC>
+__device__ __forceinline__ void set_controls(ArenaState<NC>* a, uint32_t i, const uint8_t* rows, const float* table) {
     for (int c = 0; c < NC; c++) {
         const float* t = table + 8 * (rows ? (uint32_t)rows[i * NC + c] : i * NC + c);
         Controls& ctl = a->cars[c].ctl;
@@ -135,6 +102,30 @@ __device__ __forceinline__ void decide_arenas(uint32_t* states, uint32_t n, uint
         ctl.yaw = t[3];
         ctl.roll = t[4];
         ctl.buttons = (t[5] != 0.0f ? BTN_JUMP : 0u) | (t[6] != 0.0f ? BTN_BOOST : 0u) | (t[7] != 0.0f ? BTN_HANDBRAKE : 0u);
+    }
+}
+
+// Step and decide share one kernel per car count and body set, so the tick (the whole physics inlined) is compiled
+// once for both; `mode` is the same for every thread of a launch, so it never diverges a warp, and their tick loop is
+// the same. Rollout keeps its own kernel: its stop on a goal inside the loop cost the shared tick 1.3-1.5% on 1v1
+// (3080, 6 Nov, against separate kernels).
+// - step (RUN_STEP): `ticks` ticks.
+// - decide (RUN_DECIDE), the trainer's step: an arena whose last decision scored is reset to a kickoff first (the goal
+//   reset at the decision boundary, counted in `out`), then the controls are set and `ticks` ticks run.
+enum : uint32_t { RUN_STEP = 0, RUN_DECIDE = 1 };
+
+template <int NC, bool HasPsyclops>
+__device__ __forceinline__ void run_arenas(uint32_t* states, uint32_t n, uint32_t ticks, const ArenaData& ad,
+                                           const uint8_t* rows, const float* table, uint32_t* out, uint32_t mode) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    ArenaState<NC>* a = reinterpret_cast<ArenaState<NC>*>(states) + i;
+    if (mode == RUN_DECIDE) {
+        if (a->events & 3u) {
+            kickoff_reset<NC>(*a);
+            out[i] += 1;
+        }
+        set_controls<NC>(a, i, rows, table);
     }
     EpaScratch scratch;
     GeoCache<NC> gc;  // the cars' geometry derived once per launch, not per tick (tick.h)
@@ -146,7 +137,7 @@ __device__ __forceinline__ void decide_arenas(uint32_t* states, uint32_t n, uint
 // kept readable. stop[i]: bits 0..15 the tick of this call on which the goal fell (1-based), 0xFFFF if none, 0 if the
 // arena had already stopped before the call; bits 16..17 the side that scored (events: 1 blue, 2 orange). A stopped
 // arena does not step and ignores its row.
-template <int NC, bool HasPsyclops = false>
+template <int NC, bool HasPsyclops>
 __device__ __forceinline__ void rollout_arenas(uint32_t* states, uint32_t n, uint32_t ticks, const ArenaData& ad,
                                                const uint8_t* rows, const float* table, uint32_t* stop) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -156,16 +147,7 @@ __device__ __forceinline__ void rollout_arenas(uint32_t* states, uint32_t n, uin
         stop[i] = (a->events & 3u) << 16;
         return;
     }
-    for (int c = 0; c < NC; c++) {
-        const float* t = table + 8 * (uint32_t)rows[i * NC + c];
-        Controls& ctl = a->cars[c].ctl;
-        ctl.throttle = t[0];
-        ctl.steer = t[1];
-        ctl.pitch = t[2];
-        ctl.yaw = t[3];
-        ctl.roll = t[4];
-        ctl.buttons = (t[5] != 0.0f ? BTN_JUMP : 0u) | (t[6] != 0.0f ? BTN_BOOST : 0u) | (t[7] != 0.0f ? BTN_HANDBRAKE : 0u);
-    }
+    set_controls<NC>(a, i, rows, table);
     EpaScratch scratch;
     GeoCache<NC> gc;
     gc.reset();
@@ -180,6 +162,18 @@ __device__ __forceinline__ void rollout_arenas(uint32_t* states, uint32_t n, uin
     stop[i] = out;
 }
 
+#define RLMAX_TICK_KERNEL(NC, NAME, PSYCLOPS)                                                                          \
+    extern "C" __global__ void RLMAX_TICK_BOUNDS_##NC NAME(uint32_t* states, uint32_t n, uint32_t ticks, ArenaData ad, \
+                                                           const uint8_t* rows, const float* table, uint32_t* out,     \
+                                                           uint32_t mode) {                                            \
+        run_arenas<NC, PSYCLOPS>(states, n, ticks, ad, rows, table, out, mode);                                        \
+    }
+#define RLMAX_ROLLOUT_KERNEL(NC, NAME, PSYCLOPS)                                                                       \
+    extern "C" __global__ void RLMAX_TICK_BOUNDS_##NC NAME(uint32_t* states, uint32_t n, uint32_t ticks, ArenaData ad, \
+                                                           const uint8_t* rows, const float* table, uint32_t* stop) {  \
+        rollout_arenas<NC, PSYCLOPS>(states, n, ticks, ad, rows, table, stop);                                         \
+    }
+
 // The trainer's view: one row of raw physical values per arena (physics/extract.h).
 template <int NC>
 __device__ __forceinline__ void extract_arenas(const uint32_t* states, uint32_t n, float* out) {
@@ -188,7 +182,8 @@ __device__ __forceinline__ void extract_arenas(const uint32_t* states, uint32_t 
     // whole 128-byte lines; a lane writing its own row directly stored 4 bytes per 32-byte sector (65,536 arenas: 1.9 ms
     // for 1v1, against 60 us at 8,192 while the output still fit in L2)
     constexpr int R = extract_row_floats<NC>(), RP = R | 1;
-    // eight cars' rows would pass the card's 48 KB of shared memory at 32 arenas a block (GpuBatch::extract_raw launches the same)
+    // eight cars' rows would pass the card's 48 KB of shared memory at 32 arenas a block (GpuBatch::extract_raw launches the same);
+    // seven cars' (373 floats a row, 47.7 KB) just fit
     constexpr uint32_t A = NC == 8 ? 16u : 32u;
     __shared__ float tile[A * RP];
     const uint32_t base = blockIdx.x * A, lane = threadIdx.x;
@@ -236,12 +231,7 @@ __device__ __forceinline__ void branch_arenas(uint32_t* dst, uint32_t n, const u
     if (lane == 0) reinterpret_cast<ArenaState<NC>*>(d)->rng = seed * 0x9E3779B9u + i * 0x85EBCA6Bu + 1u;
 }
 
-#define RLMAX_DECIDE(NC)                                                                                       \
-    extern "C" __global__ void RLMAX_TICK_BOUNDS_##NC rlmax_rollout_##NC(uint32_t* states, uint32_t n, uint32_t ticks,  \
-                                                                         ArenaData ad, const uint8_t* rows,           \
-                                                                         const float* table, uint32_t* stop) {        \
-        rollout_arenas<NC>(states, n, ticks, ad, rows, table, stop);                                                   \
-    }                                                                                                                  \
+#define RLMAX_ARENA_KERNELS(NC)                                                                                        \
     extern "C" __global__ void __launch_bounds__(32) rlmax_extract_##NC(const uint32_t* states, uint32_t n,           \
                                                                          float* out) {                                \
         extract_arenas<NC>(states, n, out);                                                                            \
@@ -251,20 +241,9 @@ __device__ __forceinline__ void branch_arenas(uint32_t* dst, uint32_t n, const u
                                                                         uint32_t seed) {                              \
         branch_arenas<NC>(dst, n, src, n_src, map, seed);                                                              \
     }                                                                                                                  \
-    extern "C" __global__ void RLMAX_TICK_BOUNDS_##NC rlmax_decide_##NC(uint32_t* states, uint32_t n, uint32_t ticks,   \
-                                                                        ArenaData ad, const uint8_t* rows,            \
-                                                                        const float* table, uint32_t* goals) {        \
-        decide_arenas<NC>(states, n, ticks, ad, rows, table, goals);                                                   \
-    }                                                                                                                  \
     extern "C" __global__ void __launch_bounds__(128) rlmax_kickoff_##NC(uint32_t* states, uint32_t n, uint32_t seed) { \
         kickoff_arenas<NC>(states, n, seed);                                                                           \
     }
-RLMAX_DECIDE(2)
-RLMAX_DECIDE(3)
-RLMAX_DECIDE(4)
-RLMAX_DECIDE(5)
-RLMAX_DECIDE(6)
-RLMAX_DECIDE(8)
 
 // Set one render-frame fraction per arena. A null array restores the default 0.5.
 template <int NC>
@@ -273,18 +252,38 @@ __device__ void set_pad_fractions(uint32_t* states, uint32_t n, const float* fra
     if (i < n) reinterpret_cast<ArenaState<NC>*>(states)[i].pad_frame_bits = fractions ? pad_encode_frac(fractions[i]) : 0u;
 }
 #define RLMAX_PAD_FRAC(N) extern "C" __global__ void rlmax_pad_fraction_##N(uint32_t* s, uint32_t n, const float* f) { set_pad_fractions<N>(s,n,f); }
-RLMAX_PAD_FRAC(2) RLMAX_PAD_FRAC(3) RLMAX_PAD_FRAC(4) RLMAX_PAD_FRAC(5) RLMAX_PAD_FRAC(6) RLMAX_PAD_FRAC(8)
+RLMAX_PAD_FRAC(2) RLMAX_PAD_FRAC(3) RLMAX_PAD_FRAC(4) RLMAX_PAD_FRAC(5) RLMAX_PAD_FRAC(6) RLMAX_PAD_FRAC(7) RLMAX_PAD_FRAC(8)
 
-// Separate three-wheel variants: batches without Psyclops retain the ordinary tick specialization.
-#define RLMAX_PSYCLOPS(NC) \
-    extern "C" __global__ void RLMAX_TICK_BOUNDS_##NC rlmax_step_psyclops_##NC(uint32_t* s, uint32_t n, uint32_t t, ArenaData ad) { \
-        step_arenas<NC, true>(s, n, t, ad); \
-    } \
-    extern "C" __global__ void RLMAX_TICK_BOUNDS_##NC rlmax_decide_psyclops_##NC(uint32_t* s, uint32_t n, uint32_t t, ArenaData ad, const uint8_t* rows, const float* table, uint32_t* out) { \
-        decide_arenas<NC, true>(s, n, t, ad, rows, table, out); \
-    } \
-    extern "C" __global__ void RLMAX_TICK_BOUNDS_##NC rlmax_rollout_psyclops_##NC(uint32_t* s, uint32_t n, uint32_t t, ArenaData ad, const uint8_t* rows, const float* table, uint32_t* out) { \
-        rollout_arenas<NC, true>(s, n, t, ad, rows, table, out); \
-    }
-RLMAX_PSYCLOPS(2) RLMAX_PSYCLOPS(3) RLMAX_PSYCLOPS(4)
-RLMAX_PSYCLOPS(5) RLMAX_PSYCLOPS(6) RLMAX_PSYCLOPS(8)
+// Every tick kernel is the whole physics inlined, so each car count costs the compiler as much as the next: four tick
+// kernels per car count, step/decide and rollout, each with its three-wheel variant (batches without Psyclops keep the
+// ordinary tick). RLMAX_NC_MASK (build.rs RLMAX_NCS) builds only some of them for experiments; every car count otherwise.
+#ifndef RLMAX_NC_MASK
+#define RLMAX_NC_MASK ((1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8))
+#endif
+#define RLMAX_CAR_COUNT(NC)                                                                                            \
+    RLMAX_TICK_KERNEL(NC, rlmax_tick_##NC, false)                                                                      \
+    RLMAX_TICK_KERNEL(NC, rlmax_tick_psyclops_##NC, true)                                                              \
+    RLMAX_ROLLOUT_KERNEL(NC, rlmax_rollout_##NC, false)                                                                \
+    RLMAX_ROLLOUT_KERNEL(NC, rlmax_rollout_psyclops_##NC, true)                                                        \
+    RLMAX_ARENA_KERNELS(NC)
+#if RLMAX_NC_MASK & (1 << 2)
+RLMAX_CAR_COUNT(2)
+#endif
+#if RLMAX_NC_MASK & (1 << 3)
+RLMAX_CAR_COUNT(3)
+#endif
+#if RLMAX_NC_MASK & (1 << 4)
+RLMAX_CAR_COUNT(4)
+#endif
+#if RLMAX_NC_MASK & (1 << 5)
+RLMAX_CAR_COUNT(5)
+#endif
+#if RLMAX_NC_MASK & (1 << 6)
+RLMAX_CAR_COUNT(6)
+#endif
+#if RLMAX_NC_MASK & (1 << 7)
+RLMAX_CAR_COUNT(7)
+#endif
+#if RLMAX_NC_MASK & (1 << 8)
+RLMAX_CAR_COUNT(8)
+#endif

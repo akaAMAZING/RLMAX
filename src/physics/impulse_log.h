@@ -61,6 +61,7 @@ inline void imp_rec(int ci, int src, int wheel) {
     if (wheel >= 0) imp_add(g.w[src == IL_FRIC ? 1 : 0][wheel], g_imp_last);
 }
 #define RLMAX_IMP(ci, src, expr) do { expr; ::rlmax::imp_rec((ci), (src), -1); } while (0)
+// the ball's seed slot follows the cars' (0..NC-1): 7 for up to seven cars, 8 for eight
 #define RLMAX_SEED_BALL(b, keep) do { const int slot_ = NC == 8 ? 8 : 7; if (::rlmax::g_seed_valid[slot_]) { (b).r = ::rlmax::g_seed_basis[slot_]; (b).inv_i = world_inv_inertia((b).r, (b).inv_i_local); if (!(keep)) ::rlmax::g_seed_valid[slot_] = false; } } while (0)
 #define RLMAX_SEED_BASIS(ci, b) do { if (::rlmax::g_seed_valid[ci]) { (b).r = ::rlmax::g_seed_basis[ci]; (b).inv_i = world_inv_inertia((b).r, (b).inv_i_local); ::rlmax::g_seed_valid[ci] = false; } } while (0)
 #define RLMAX_WHEEL_DBG(ci, i, w) do { float* d_ = ::rlmax::g_wheel_log[ci][i]; d_[0] = (w).hit ? 1.0f : 0.0f; d_[1] = (w).susp_len; d_[2] = (w).susp_rel_vel; d_[3] = (w).contact_normal.x; d_[4] = (w).contact_normal.y; d_[5] = (w).contact_normal.z; d_[6] = (w).steer_angle; d_[7] = (w).engine_force; d_[8] = (w).brake; d_[9] = (w).lat_friction; d_[10] = (w).long_friction; d_[11] = (w).extra_pushback; } while (0)

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "car_tick.h"
+#include "countdown.h"
 #include "demo.h"
 #include "manifold.h"
 #include "pads.h"
@@ -193,6 +194,8 @@ RLMAX_HD void fs_respawn_override(CarState& cs, int i) {
 template <int NC>
 RLMAX_HD void kickoff_reset(ArenaState<NC>& s) {
     s.seed_mask = 0;
+    s.countdown = 0;
+    s.countdown_count = 0.0f;
     int perm[5] = {0, 1, 2, 3, 4};
     for (int k = 4; k > 0; k--) {
         const int j = (int)(rng_next(s.rng) % (uint32_t)(k + 1));
@@ -216,7 +219,7 @@ RLMAX_HD void kickoff_reset(ArenaState<NC>& s) {
         CarState& cs = s.cars[i];
         uint32_t team = (uint32_t)(i % 2);
         int spot = i / 2;
-        if constexpr (NC == 3 || NC == 5 || NC == 8) {
+        if constexpr (NC == 3 || NC == 5 || NC == 7 || NC == 8) {
             team = cs.team == 0 ? 0u : 1u;
             spot = team_count[team]++;
         }
@@ -462,7 +465,7 @@ RLMAX_COLD void emit_rows(TickSolver<NC>& sv, const RowSource<NC>& r, const Aren
     constexpr int BIT_BW = NC * CAR_WORLD_MANIFOLDS, BIT_BC = BIT_BW + BALL_WORLD_MANIFOLDS, BIT_CC = BIT_BC + NC;
     const Body* bodies = r.bodies;
     uint64_t done = 0;
-    uint32_t done_pairs = 0;  // eight-car pair bits do not fit in done
+    uint32_t done_pairs = 0;  // eight-car pair bits do not fit in done (seven cars' last bit is 4*7 + 4 + 7 + 20 = 59, so they do)
     auto emit_cw = [&](int i, int q) {
         done |= 1ull << (i * CAR_WORLD_MANIFOLDS + q);
         if (q >= (int)s.cars[i].wman.n) return;
@@ -651,7 +654,7 @@ RLMAX_HD void update_visit_order(ArenaState<NC>& s) {
         off |= 1u << i;
     }
     uint32_t v = off << 24;
-    for (int k = 0; k < NC; k++) v |= (uint32_t)(o[k] ^ k) << ((NC == 8 ? 3 : 4) * k);
+    for (int k = 0; k < NC; k++) v |= (uint32_t)(o[k] ^ k) << (visit_bits<NC>() * k);
     s.visit = v;
 }
 
@@ -664,6 +667,7 @@ RLMAX_HD void tick_impl(ArenaState<NC>& s, const ArenaData& ad, EpaScratch& scra
     for (int o = 0; o < (int)sizeof(s.sweep); o += 128)
         asm volatile("prefetch.global.L2 [%0];" ::"l"(reinterpret_cast<const char*>(&s.sweep) + o));
 #endif
+    if (s.countdown) countdown_hold<NC>(s);  // the round countdown: every car undriven
     const TickConsts k = tick_consts();
     for (int i = 0; i < NC; i++) {
         const uint32_t b = s.cars[i].body, key = b < (uint32_t)NUM_BODY_PRESETS ? b : 0u;
@@ -774,9 +778,7 @@ RLMAX_HD void tick_impl(ArenaState<NC>& s, const ArenaData& ad, EpaScratch& scra
             spawned = make_body(cs.pos, cs.rot, cs.vel, cs.ang_vel, c::CAR_MASS_BT, geo[i].inv_inertia_local);
             spawned.inv_i = world_inv_inertia(respawn_inertia_basis(cs.team), spawned.inv_i_local);
             const V3 spawn_pos = spawned.pos;
-#if !defined(RLMAX_FULL_STATE)
             pre_q_pos[1 + i] = spawn_pos;
-#endif
             if (quirk::QUANTIZE_PHYS) quantize_body(spawned, spawned.vel_uu);
         }
         if constexpr (HasPsyclops) {
@@ -1370,16 +1372,19 @@ RLMAX_HD void tick_impl(ArenaState<NC>& s, const ArenaData& ad, EpaScratch& scra
     }
     RLMAX_PROF(16)
     // ---- boost pads, on the cars' end-of-tick state
-    // the suite's scorer gives pad boost from the game's recorded pickups, so its test build runs no pads of its own
-#if !defined(RLMAX_FULL_STATE)
-    pads_update<NC>(s, bodies, geo, pre_q_pos);
+    // the suite's scorer gives pad boost from the game's recorded pickups, so its test build runs no pads of its own, except for the
+    // controls-only recordings, which turn them on (full_state.h g_fs_pads)
+#if defined(RLMAX_FULL_STATE)
+    if (g_fs_pads)
 #endif
+    pads_update<NC>(s, bodies, geo, pre_q_pos);
 
     bs.pos = bodies[0].pos;
     bs.rot = bodies[0].rot;
     bs.vel = bodies[0].vel;
     bs.ang_vel = bodies[0].ang;
     s.tick += 1;
+    if (s.countdown) countdown_advance(s.countdown, s.countdown_count, s.pad_frame_bits);
 
     const float goal_y = (c::GOAL_THRESHOLD_Y_UU + c::BALL_RADIUS_UU) * c::UU_TO_BT;
     if (bs.pos.y > goal_y) s.events |= 1u;   // in orange's goal: blue scored

@@ -105,6 +105,7 @@ int with_nc(uint32_t nc, F&& f) {
         case 4: return f(std::integral_constant<int, 4>{});
         case 5: return f(std::integral_constant<int, 5>{});
         case 6: return f(std::integral_constant<int, 6>{});
+        case 7: return f(std::integral_constant<int, 7>{});
         case 8: return f(std::integral_constant<int, 8>{});
         default: return -1;
     }
@@ -123,6 +124,7 @@ uint32_t rlmax_state_words(uint32_t nc) {
         case 4: return (uint32_t)state_words<4>();
         case 5: return (uint32_t)state_words<5>();
         case 6: return (uint32_t)state_words<6>();
+        case 7: return (uint32_t)state_words<7>();
         case 8: return (uint32_t)state_words<8>();
         default: return 0;
     }
@@ -159,6 +161,7 @@ uint32_t rlmax_extract_row_floats(uint32_t nc) {
         case 4: return (uint32_t)extract_row_floats<4>();
         case 5: return (uint32_t)extract_row_floats<5>();
         case 6: return (uint32_t)extract_row_floats<6>();
+        case 7: return (uint32_t)extract_row_floats<7>();
         case 8: return (uint32_t)extract_row_floats<8>();
         default: return 0;
     }
@@ -469,6 +472,128 @@ int rlmax_refresh_sticky_gate_with_wheels(uint32_t nc, uint32_t* state, uint32_t
 
 int rlmax_refresh_sticky_gate(uint32_t nc, uint32_t* state, uint32_t ci, const RlmaxArenaData* arena) {
     return rlmax_refresh_sticky_gate_with_wheels(nc, state, ci, 15, arena);
+}
+
+// Batched replay starts (the trainer's rows, to arena states). Per arena: ball[9] (pos uu, vel uu/s,
+// ang rad/s), pads[34] (seconds until active), cars[nc][27] (pos 3, vel 3, ang 3, fwd 3, up 3, boost 0..1, on_ground, has_jump,
+// has_flip, demo_timer, jump_time, flip_time, air_time, boost_time, handbrake, flip_dir 2), team[nc], body[nc], prev_jump[nc].
+// The reset is Arena::from_physical's (cpu.rs): last controls zero, manifolds/sweep/pad touches fresh, each car's sticky gate
+// from its wheel rays once every body is placed. See rlmax.h for what the mapped fields mean.
+int rlmax_states_from_rows(uint32_t nc, uint32_t n, const float* ball, const float* pads, const float* cars, const uint32_t* team,
+                           const uint32_t* body, const uint8_t* prev_jump, const float* dodge_age, const RlmaxArenaData* arena,
+                           uint32_t* out) {
+    const uint32_t words = rlmax_state_words(nc);
+    if (words == 0) return -1;
+    for (uint32_t ai = 0; ai < n; ai++) {
+        uint32_t* st = out + (size_t)ai * words;
+        rlmax_init_arena(nc, st);
+        const float* bl = ball + (size_t)ai * 9;
+        RlmaxBall rb;
+        memset(&rb, 0, sizeof(rb));
+        for (int k = 0; k < 3; k++) {
+            rb.body.pos[k] = bl[k];
+            rb.body.vel[k] = bl[3 + k];
+            rb.body.ang_vel[k] = bl[6 + k];
+        }
+        rb.body.rot[0] = rb.body.rot[4] = rb.body.rot[8] = 1.0f;  // identity, as init_arena's ball
+        rb.sleeping = 3;
+        rlmax_set_ball(nc, st, &rb);
+        with_nc(nc, [&](auto k) {
+            constexpr int NC = decltype(k)::value;
+            auto* a = reinterpret_cast<ArenaState<NC>*>(st);
+            const float* pd = pads + (size_t)ai * NUM_PADS;
+            a->tick = 0;
+            for (int p = 0; p < NUM_PADS; p++) {
+                // extract reads cooldown - (tick - gave) * DT: a pickup n ticks before tick 0 leaves cooldown - n * DT
+                // (nearest tick; gave == 0xFFFFFFFF is "never", so n = 1 is carried as 2)
+                if (!(pd[p] > 0.0f)) { a->pad_gave_tick[p] = PAD_NONE; continue; }
+                const float cd = pad_def(p).big ? c::PAD_COOLDOWN_BIG : c::PAD_COOLDOWN_SMALL;
+                int ticks_ago = (int)floorf((cd - fmin_(pd[p], cd)) / c::DT + 0.5f);
+                if (ticks_ago == 1) ticks_ago = 2;
+                a->pad_gave_tick[p] = (uint32_t)(0 - ticks_ago);
+            }
+            return 0;
+        });
+        for (uint32_t ci = 0; ci < nc; ci++) {
+            const float* r = cars + ((size_t)ai * nc + ci) * 27;
+            RlmaxCar cs;
+            memset(&cs, 0, sizeof(cs));
+            const V3 fwd = v3_from(r + 9), up = v3_from(r + 12);
+            const V3 right = cross(up, fwd);  // the basis's second column (identity: fwd +x, right +y, up +z)
+            v3_to(fwd, cs.body.rot);
+            v3_to(right, cs.body.rot + 3);
+            v3_to(up, cs.body.rot + 6);
+            for (int k = 0; k < 3; k++) {
+                cs.body.pos[k] = r[k];
+                cs.body.vel[k] = r[3 + k];
+                cs.body.ang_vel[k] = r[6 + k];
+            }
+            cs.team = team[(size_t)ai * nc + ci];
+            cs.preset = body[(size_t)ai * nc + ci];
+            cs.boost = r[15] * 100.0f;
+            const bool on_ground = r[16] > 0.5f, has_jump = r[17] > 0.5f, has_flip = r[18] > 0.5f;
+            const float demo = r[19], flip_time = r[21], air = r[22];
+            cs.flip_torque[0] = r[25];
+            cs.flip_torque[1] = r[26];
+            uint32_t f = 0;
+            if (on_ground) f |= RLMAX_CAR_ON_GROUND;
+            if (demo > 0.0f) f |= RLMAX_CAR_IS_DEMOED;
+            if (prev_jump[(size_t)ai * nc + ci]) f |= RLMAX_CAR_PREV_JUMP;
+            // A grounded car can be in the first ticks of a jump still held: the row's has_jump reads 1 on the ground, so the jump
+            // shows only as its timer under the hold limit, the button held, and the jump's impulse along up (its immediate speed,
+            // less gravity over at most 0.2 s, never under half of it). A car respawned under 0.2 s ago with jump held has the
+            // timer and the button but falls or rests: it is left as it was.
+            const bool jumping = on_ground && prev_jump[(size_t)ai * nc + ci] &&
+                                 (uint32_t)floorf(r[20] * 120.0f + 0.5f) <= c::JUMP_MAX_TICKS &&
+                                 dot(v3_from(r + 3), up) >= 0.5f * c::JUMP_IMMEDIATE_FORCE_UU;
+            if (jumping) f |= RLMAX_CAR_HAS_JUMPED | RLMAX_CAR_IS_JUMPING;
+            if (!on_ground) {
+                // obs.py: has_jump = on_ground | !has_jumped; has_flip = on_ground | (!double & !flipped & air < 1.25)
+                if (!has_jump) f |= RLMAX_CAR_HAS_JUMPED;
+                if (!has_flip && !has_jump) {
+                    // a dodge or a double jump spent the second jump, or the dodge window has passed; flip_time restarts at a
+                    // dodge, so it is within this airtime's span only if the dodge happened in it
+                    if ((r[25] != 0.0f || r[26] != 0.0f) && flip_time <= air + c::DT) {
+                        f |= RLMAX_CAR_HAS_FLIPPED;
+                        // flip_time also restarts when the torque ends (car_tick.h), so air - flip_time is the airtime at the
+                        // dodge less a tick while the torque runs, and at least FLIP_TORQUE_TIME less a tick after it ends. Below
+                        // that bound the torque is running. Above it the two can't be told apart: a dodge begun 0.65 s or more
+                        // after the jump reads as finished, which drops its remaining torque rather than granting a second one.
+                        if (air - flip_time < c::FLIP_TORQUE_TIME - 1.5f * c::DT) f |= RLMAX_CAR_IS_FLIPPING;
+                    } else if (air < c::DOUBLEJUMP_MAX_DELAY) {
+                        f |= RLMAX_CAR_HAS_DOUBLE_JUMPED;
+                    }
+                }
+                // mapping: the old state had no air-jump-used flag, a spent second jump was HAS_DOUBLE_JUMPED or HAS_FLIPPED; now
+                // the air jump is gated by CF_AIR_JUMP_USED (car_tick.h) and rlmax_set_car copies the flags as given, so a spent
+                // second jump sets it too, or the car would jump a third time in the air
+                if (f & (RLMAX_CAR_HAS_DOUBLE_JUMPED | RLMAX_CAR_HAS_FLIPPED)) f |= CF_AIR_JUMP_USED;
+            }
+            // The dodge's own age, when the caller knows it, settles what the row cannot: the car has flipped (on the ground
+            // too, where the row's has_flip reads 1), and flip_time counts from the dodge until its torque ends, then restarts,
+            // so the flip still runs exactly when the two agree. A grounded car's flip ends on its next tick (car_tick.h).
+            if (dodge_age && dodge_age[(size_t)ai * nc + ci] >= 0.0f) {
+                const float age = dodge_age[(size_t)ai * nc + ci];
+                f = (f & ~(RLMAX_CAR_IS_FLIPPING | RLMAX_CAR_HAS_DOUBLE_JUMPED)) | RLMAX_CAR_HAS_JUMPED | RLMAX_CAR_HAS_FLIPPED |
+                    CF_AIR_JUMP_USED;
+                if (!on_ground && absf(age - flip_time) < 0.5f * c::DT && flip_time < c::FLIP_TORQUE_TIME) f |= RLMAX_CAR_IS_FLIPPING;
+            }
+            cs.flags = f;
+            cs.demo_respawn_timer = demo;
+            cs.jump_ticks = (uint32_t)floorf(r[20] * 120.0f + 0.5f);
+            cs.flip_time = flip_time;
+            // mapping: the old air_time_since_jump was the row's air time, taken as it came; the field is now time_since_jump,
+            // counted every tick the jump is not held (ground included, car_tick.h). An airborne car gets the row's air time
+            // unchanged (the 1.25 s air-jump window reads it); a grounded car gets JUMP_REARM_TIME, where its jump is armed
+            cs.time_since_jump = jumping ? 0.0f : on_ground ? c::JUMP_REARM_TIME : air;
+            cs.air_time = on_ground ? 0.0f : air;
+            cs.time_since_boosted = r[23];
+            cs.handbrake_val = r[24];
+            if (rlmax_set_car(nc, st, ci, &cs) != 0) return -1;
+        }
+        for (uint32_t ci = 0; ci < nc; ci++) rlmax_refresh_sticky_gate(nc, st, ci, arena);
+    }
+    return 0;
 }
 
 }  // extern "C"

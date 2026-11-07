@@ -5,7 +5,7 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let include = repo.join("src");
 
-    // RLMAX_CPU_ONLY=1: empty kernel images (GPU calls fail at load), for fast CPU-only iteration; never a gate build
+    // RLMAX_CPU_ONLY=1: empty kernel images (GPU calls fail at load), for fast CPU-only iteration; never for a full build
     println!("cargo:rerun-if-env-changed=RLMAX_CPU_ONLY");
     let cpu_only = std::env::var("RLMAX_CPU_ONLY").is_ok_and(|v| v == "1");
     // under clippy (its own build-script run and OUT_DIR) the images are only type-checked, so nvcc is not run twice
@@ -14,16 +14,28 @@ fn main() {
         for f in ["smoke.fatbin", "step_exact.fatbin", "step_prof.fatbin", "staged.fatbin"] {
             std::fs::write(out.join(f), b"").unwrap();
         }
+        cpu_build(&repo, &include);
     } else {
         println!("cargo:rustc-env=RLMAX_CUDA_RELEASE={}", rlmax_nvcc::nvcc_release(&rlmax_nvcc::cuda_root()));
-        gpu_images(&repo, &out, &include);
+        let staged = || {
+            let dir = repo.join("src/staged");
+            rlmax_nvcc::fatbin_with(&dir.join("stages.cu"), &out.join("staged.fatbin"),
+                &[&dir, &include], &[], &["--fmad=false", "-prec-div=true", "-prec-sqrt=true", "-ftz=false"]);
+        };
+        // with RLMAX_NVCC_SPLIT above 1 the machine has room for more than one compiler: the two images and the CPU
+        // build at once (a 2-car build: step 6.1 min, staged 3.6, CPU 1.3 one after another)
+        if rlmax_nvcc::split_jobs() > 1 {
+            std::thread::scope(|s| {
+                s.spawn(staged);
+                s.spawn(|| cpu_build(&repo, &include));
+                gpu_images(&repo, &out, &include);
+            });
+        } else {
+            gpu_images(&repo, &out, &include);
+            staged();
+            cpu_build(&repo, &include);
+        }
     }
-    if !(cpu_only || lint_only) {
-        let staged = repo.join("src/staged");
-        rlmax_nvcc::fatbin_with(&staged.join("stages.cu"), &out.join("staged.fatbin"),
-            &[&staged, &include], &[], &["--fmad=false", "-prec-div=true", "-prec-sqrt=true", "-ftz=false"]);
-    }
-    cpu_build(&repo, &include);
     // Separate translation unit: stage-only headers must not change the ordinary CPU tick.
     let mut stage_size=cc::Build::new();
     stage_size.cpp(true).file(repo.join("src/staged/sizes.cpp"))
@@ -40,7 +52,7 @@ fn main() {
 fn gpu_images(repo: &std::path::Path, out: &std::path::Path, include: &std::path::Path) {
     let include = include.to_path_buf();
     // RLMAX_REGS=2=128,6=224: register budgets of the tick kernels per car count (src/kernels/step.cu), for measuring
-    // the per-arch choice; never a gate build
+    // the per-arch choice; never for a full build
     println!("cargo:rerun-if-env-changed=RLMAX_REGS");
     let regs: Vec<(String, String)> = std::env::var("RLMAX_REGS")
         .unwrap_or_default()
@@ -48,7 +60,18 @@ fn gpu_images(repo: &std::path::Path, out: &std::path::Path, include: &std::path
         .filter_map(|kv| kv.split_once('='))
         .map(|(k, v)| (format!("RLMAX_REGS_{}", k.trim()), v.trim().to_string()))
         .collect();
-    let regs: Vec<(&str, &str)> = regs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    // RLMAX_NCS=2,6: build only these car counts' tick kernels (any other batch fails at load), for fast experiments;
+    // never for a full build
+    println!("cargo:rerun-if-env-changed=RLMAX_NCS");
+    let mask = std::env::var("RLMAX_NCS").ok().map(|v| {
+        let m = v.split(',').filter_map(|n| n.trim().parse::<u32>().ok()).filter(|n| (2..=8).contains(n)).fold(0u32, |m, n| m | 1 << n);
+        println!("cargo:warning=RLMAX_NCS={v}: only these car counts' kernels are built; not a full build");
+        m.to_string()
+    });
+    let mut regs: Vec<(&str, &str)> = regs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    if let Some(m) = &mask {
+        regs.push(("RLMAX_NC_MASK", m));
+    }
     let prof: Vec<(&str, &str)> = regs.iter().copied().chain([("RLMAX_PROFILE", "1")]).collect();
     rlmax_nvcc::fatbin(&repo.join("src/kernels/smoke.cu"), &out.join("smoke.fatbin"), &[&include], &[]);
     // the oracle build of the step kernel: exact math, so it equals the CPU build on every word
@@ -92,7 +115,7 @@ fn cpu_build(repo: &std::path::Path, include: &std::path::Path) {
     }
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     std::fs::write(out.join("cpu_compiler.txt"), cpu.get_compiler().path().display().to_string()).unwrap();
-    // RLMAX_CPU_UBSAN=1: UndefinedBehaviorSanitizer on the CPU physics, for hunting defects; never a gate build
+    // RLMAX_CPU_UBSAN=1: UndefinedBehaviorSanitizer on the CPU physics, for hunting defects; never for a full build
     println!("cargo:rerun-if-env-changed=RLMAX_CPU_UBSAN");
     let ubsan = std::env::var("RLMAX_CPU_UBSAN").is_ok_and(|v| v == "1");
     if ubsan {

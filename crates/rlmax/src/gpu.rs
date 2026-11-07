@@ -161,6 +161,11 @@ pub fn staged_max_per_sm(compute_capability: (i32, i32), num_cars: u32) -> u32 {
 /// default) ends longer launches, and a long launch stalls the desktop. Launches are sized to 80% of it.
 pub const MAX_LAUNCH_S: f64 = 0.5;
 
+// The tick kernel's run modes (src/kernels/step.cu run_arenas); rollout is its own kernel (rollout_arenas).
+const RUN_STEP: u32 = 0;
+const RUN_DECIDE: u32 = 1;
+const RUN_ROLLOUT: u32 = 2;
+
 impl GpuBatch {
     /// `words` holds `num_arenas` arena states back to back (`rlmax_state_words(num_cars)` words each).
     /// This selects the standard kernels; use [`GpuBatch::new_with_psyclops`] if any car can be Psyclops.
@@ -255,9 +260,9 @@ impl GpuBatch {
         self.has_psyclops = has_psyclops;
     }
 
-    /// The step kernel for this car count.
+    /// The tick kernel for this car count and body set (`rlmax_tick`: step and decide in one, src/kernels/step.cu).
     pub fn step_kernel(&self) -> Result<crate::driver::Function<'_>> {
-        self.tick_kernel("rlmax_step")
+        self.tick_kernel()
     }
 
     /// One launch of `ticks` ticks, not synchronised.
@@ -265,15 +270,7 @@ impl GpuBatch {
         if self.staged_scratch.is_some() && !self.has_psyclops {
             return unsafe { self.launch_staged(data, ticks, 0) };
         }
-        let f = self.step_kernel()?;
-        let (mut p, mut n, mut t, mut ad) = (self.states.ptr(), self.num_arenas, ticks, data.raw);
-        let mut params = [
-            (&mut p as *mut DevicePtr).cast::<c_void>(),
-            (&mut n as *mut u32).cast(),
-            (&mut t as *mut u32).cast(),
-            (&mut ad as *mut DevArenaData).cast(),
-        ];
-        unsafe { f.launch(self.num_arenas.div_ceil(self.block), self.block, &mut params) }
+        unsafe { self.tick_launch(RUN_STEP, data, ticks, 0, 0, 0, 0) }
     }
 
     /// The profiling build's per-stage warp cycles since the last read (lane 0 of each warp), then cleared.
@@ -335,12 +332,12 @@ impl GpuBatch {
         unsafe { f.launch(count.div_ceil(128), 128, &mut params) }
     }
 
-    fn tick_kernel(&self, base: &str) -> Result<crate::driver::Function<'_>> {
-        if self.has_psyclops {
-            self.kernel(&format!("{base}_psyclops"))
-        } else {
-            self.kernel(base)
-        }
+    fn tick_kernel(&self) -> Result<crate::driver::Function<'_>> {
+        self.kernel(if self.has_psyclops { "rlmax_tick_psyclops" } else { "rlmax_tick" })
+    }
+
+    fn rollout_kernel(&self) -> Result<crate::driver::Function<'_>> {
+        self.kernel(if self.has_psyclops { "rlmax_rollout_psyclops" } else { "rlmax_rollout" })
     }
 
     /// Every arena to a kickoff (`rlmax_kickoff`), its rng seeded from `seed` and the arena index. Not synchronised.
@@ -394,7 +391,7 @@ impl GpuBatch {
         unsafe { f.launch_on((self.num_arenas as u64 * 32).div_ceil(128) as u32, 128, &mut params, stream) }
     }
 
-    /// One decision (`rlmax_decide`): goal resets, each car's action row (one byte per car, arena-major) through the
+    /// One decision (`rlmax_tick` in decide mode): goal resets, each car's action row (one byte per car, arena-major) through the
     /// 8-float action `table` (any number of rows up to 256), then `ticks` ticks; resets are counted per arena in
     /// `goals`. Not synchronised.
     pub fn decide(&mut self, data: &GpuArenaData, ticks: u32, rows: &Buffer<u8>, table: &Buffer<f32>, goals: &Buffer<u32>) -> Result<()> {
@@ -407,7 +404,7 @@ impl GpuBatch {
     /// # Safety
     /// `rows` holds num_arenas x num_cars bytes, every one a row of `table` (8 floats per row); `goals` one u32 per arena.
     pub unsafe fn decide_raw(&mut self, data: &GpuArenaData, ticks: u32, rows: DevicePtr, table: DevicePtr, goals: DevicePtr, stream: u64) -> Result<()> {
-        unsafe { self.tick_launch("rlmax_decide", data, ticks, rows, table, goals, stream) }
+        unsafe { self.tick_launch(RUN_DECIDE, data, ticks, rows, table, goals, stream) }
     }
 
     /// [`GpuBatch::decide`] with raw controls in place of rows: `controls` holds 8 floats per car, arena-major (the
@@ -417,7 +414,7 @@ impl GpuBatch {
     /// # Safety
     /// `controls` holds num_arenas x num_cars x 8 floats; `goals` one u32 per arena.
     pub unsafe fn decide_controls_raw(&mut self, data: &GpuArenaData, ticks: u32, controls: DevicePtr, goals: DevicePtr, stream: u64) -> Result<()> {
-        unsafe { self.tick_launch("rlmax_decide", data, ticks, 0, controls, goals, stream) }
+        unsafe { self.tick_launch(RUN_DECIDE, data, ticks, 0, controls, goals, stream) }
     }
 
     /// One decision of a short rollout (`rlmax_rollout`): as [`GpuBatch::decide`], but a goal stops its arena where it
@@ -434,7 +431,18 @@ impl GpuBatch {
     /// # Safety
     /// As [`GpuBatch::decide_raw`], with `stop` one u32 per arena.
     pub unsafe fn rollout_raw(&mut self, data: &GpuArenaData, ticks: u32, rows: DevicePtr, table: DevicePtr, stop: DevicePtr, stream: u64) -> Result<()> {
-        unsafe { self.tick_launch("rlmax_rollout", data, ticks, rows, table, stop, stream) }
+        unsafe { self.tick_launch(RUN_ROLLOUT, data, ticks, rows, table, stop, stream) }
+    }
+
+    /// [`GpuBatch::rollout`] with raw controls in place of rows: `controls` holds 8 floats per car, arena-major (the
+    /// action table's order), as [`GpuBatch::decide_controls_raw`] takes them. A decision split into two rollouts
+    /// (e.g. one tick on the previous controls, then the rest on the new ones) equals one rollout of all its ticks on
+    /// every word when the controls are equal: launches carry no state between them. Not synchronised.
+    ///
+    /// # Safety
+    /// `controls` holds num_arenas x num_cars x 8 floats; `stop` one u32 per arena.
+    pub unsafe fn rollout_controls_raw(&mut self, data: &GpuArenaData, ticks: u32, controls: DevicePtr, stop: DevicePtr, stream: u64) -> Result<()> {
+        unsafe { self.tick_launch(RUN_ROLLOUT, data, ticks, 0, controls, stop, stream) }
     }
 
     /// Every arena's extract row (physics/extract.h; [`crate::cpu::extract_row_floats`] floats per arena,
@@ -514,9 +522,10 @@ impl GpuBatch {
         Ok(())
     }
 
+    /// `mode`: [`RUN_STEP`], [`RUN_DECIDE`] or [`RUN_ROLLOUT`], the tick kernel's run modes (src/kernels/step.cu).
     #[allow(clippy::too_many_arguments)]
-    unsafe fn tick_launch(&self, base: &str, data: &GpuArenaData, ticks: u32, rows: DevicePtr, table: DevicePtr, out: DevicePtr, stream: u64) -> Result<()> {
-        if base == "rlmax_decide" && self.staged_scratch.is_some() && !self.has_psyclops {
+    unsafe fn tick_launch(&self, mode: u32, data: &GpuArenaData, ticks: u32, rows: DevicePtr, table: DevicePtr, out: DevicePtr, stream: u64) -> Result<()> {
+        if mode == RUN_DECIDE && self.staged_scratch.is_some() && !self.has_psyclops {
             let f = self.kernel("rlmax_staged_controls")?;
             let (mut p, mut n, mut r, mut tb, mut g) = (self.states.ptr(), self.num_arenas, rows, table, out);
             let mut params = [(&mut p as *mut DevicePtr).cast::<c_void>(), (&mut n as *mut u32).cast(),
@@ -524,9 +533,9 @@ impl GpuBatch {
             unsafe { f.launch_on(self.num_arenas.div_ceil(self.staged_block), self.staged_block, &mut params, stream)?; }
             return unsafe { self.launch_staged(data, ticks, stream) };
         }
-        let f = self.tick_kernel(base)?;
+        let f = if mode == RUN_ROLLOUT { self.rollout_kernel()? } else { self.tick_kernel()? };
         let (mut p, mut n, mut t, mut ad) = (self.states.ptr(), self.num_arenas, ticks, data.raw);
-        let (mut r, mut tb, mut g) = (rows, table, out);
+        let (mut r, mut tb, mut g, mut m) = (rows, table, out, mode);
         let mut params = [
             (&mut p as *mut DevicePtr).cast::<c_void>(),
             (&mut n as *mut u32).cast(),
@@ -535,8 +544,11 @@ impl GpuBatch {
             (&mut r as *mut DevicePtr).cast(),
             (&mut tb as *mut DevicePtr).cast(),
             (&mut g as *mut DevicePtr).cast(),
+            (&mut m as *mut u32).cast(),
         ];
-        unsafe { f.launch_on(self.num_arenas.div_ceil(self.block), self.block, &mut params, stream) }
+        // the rollout kernel takes no mode
+        let count = if mode == RUN_ROLLOUT { 7 } else { 8 };
+        unsafe { f.launch_on(self.num_arenas.div_ceil(self.block), self.block, &mut params[..count], stream) }
     }
 }
 
@@ -610,8 +622,7 @@ mod tests {
         for num_cars in [2u32, 4, 6] {
             let words = parity_arenas(num_cars, 1).remove(0).words().to_vec();
             let batch = GpuBatch::new(&dev, num_cars, &words).unwrap();
-            for base in ["rlmax_step", "rlmax_decide"] {
-                let f = batch.kernel(base).unwrap();
+            for (base, f) in [("rlmax_tick", batch.tick_kernel().unwrap()), ("rlmax_rollout", batch.rollout_kernel().unwrap())] {
                 let regs = f.num_regs().unwrap();
                 // registers are allocated per warp in units of 256
                 let per_warp = (regs * 32 + 255) / 256 * 256;
@@ -757,6 +768,122 @@ mod tests {
         batch.read(&mut again).unwrap();
         assert_eq!(again, got, "a stopped arena does not step");
         eprintln!("goal at tick {goal_tick}: stopped, reported, frozen");
+
+        // A branch is an exact copy, events included: a branch of the scored arena is stopped too, and decide resets it
+        // to a kickoff at the boundary and counts the goal. An out-of-range map entry leaves its arena as it was.
+        let src = Buffer::from_slice(&dev, &got).unwrap();
+        let mut live = crate::cpu::Arena::new(num_cars);
+        live.kickoff(2);
+        let start: Vec<u32> = live.words().iter().chain(live.words()).copied().collect();
+        let mut br = GpuBatch::new(&dev, num_cars, &start).unwrap();
+        br.branch(&src, &Buffer::from_slice(&dev, &[0u32, 5]).unwrap(), 9).unwrap();
+        dev.synchronize().unwrap();
+        let mut copied = vec![0u32; 2 * per];
+        br.read(&mut copied).unwrap();
+        let diff = copied[..per].iter().zip(&got).filter(|(x, y)| x != y).count();
+        assert!(diff <= 1, "the branch differs from its source in {diff} words (only the rng is reseeded)");
+        assert_eq!(&copied[per..], live.words(), "an out-of-range map entry leaves its arena as it was");
+        let (rows2, stop2) = (Buffer::from_slice(&dev, &[0u8; 4]).unwrap(), Buffer::from_slice(&dev, &[0u32; 2]).unwrap());
+        br.rollout(&gdata, 8, &rows2, &table, &stop2).unwrap();
+        dev.synchronize().unwrap();
+        let mut s2 = [0u32; 2];
+        stop2.read(&mut s2).unwrap();
+        assert_eq!(s2, [2 << 16, 0xFFFF], "the scored branch is stopped; the live arena plays");
+        let goals = Buffer::from_slice(&dev, &[0u32; 2]).unwrap();
+        br.decide(&gdata, 8, &rows2, &table, &goals).unwrap();
+        dev.synchronize().unwrap();
+        let mut g2 = [0u32; 2];
+        goals.read(&mut g2).unwrap();
+        assert_eq!(g2, [1, 0], "decide resets the scored branch and counts its goal");
+        br.rollout(&gdata, 8, &rows2, &table, &stop2).unwrap();
+        dev.synchronize().unwrap();
+        stop2.read(&mut s2).unwrap();
+        assert_eq!(s2[0], 0xFFFF, "after the reset the branch plays");
+        eprintln!("branch of a scored arena: copied with its events, stopped, reset by decide; out-of-range entry untouched");
+    }
+
+    /// A decision split into two rollouts (the play delay: `s` ticks on the previous controls, then the rest on the
+    /// new ones) equals one rollout when the controls are equal, raw controls equal table rows, and a goal in either
+    /// phase stops the arena on its tick: in phase 1 the second call reports it already stopped.
+    #[test]
+    fn rollout_split_equals_whole() {
+        let Ok(data) = ArenaData::soccar_from_env() else {
+            eprintln!("no meshes; skipped");
+            return;
+        };
+        let dev = Device::open(0).expect("open device 0");
+        let gdata = GpuArenaData::upload(&dev, &data).unwrap();
+        let per = |nc: u32| crate::cpu::state_words(nc) as usize;
+        // played arenas: rows of an 8-row table, the same rows as raw controls, then whole against split
+        for num_cars in [2u32, 6] {
+            let n = 64usize;
+            let words: Vec<u32> = parity_arenas(num_cars, n).iter().flat_map(|a| a.words().iter().copied()).collect();
+            let table: Vec<f32> = (0..8 * 8).map(|k| ((k * 37 % 17) as f32 / 8.0 - 1.0).clamp(-1.0, 1.0)).collect();
+            let rows: Vec<u8> = (0..n * num_cars as usize).map(|k| (k * 5 % 8) as u8).collect();
+            let raw: Vec<f32> = rows.iter().flat_map(|&r| table[8 * r as usize..8 * r as usize + 8].iter().copied()).collect();
+            let (tb, rb, cb) = (Buffer::from_slice(&dev, &table).unwrap(), Buffer::from_slice(&dev, &rows).unwrap(), Buffer::from_slice(&dev, &raw).unwrap());
+            let run = |split: Option<u32>, use_rows: bool| -> (Vec<u32>, Vec<u32>) {
+                let mut b = GpuBatch::new(&dev, num_cars, &words).unwrap();
+                let stop = Buffer::from_slice(&dev, &vec![0u32; n]).unwrap();
+                let go = |b: &mut GpuBatch, t: u32| unsafe {
+                    if use_rows { b.rollout_raw(&gdata, t, rb.ptr(), tb.ptr(), stop.ptr(), 0) } else { b.rollout_controls_raw(&gdata, t, cb.ptr(), stop.ptr(), 0) }
+                }
+                .unwrap();
+                match split {
+                    None => go(&mut b, 4),
+                    Some(s) => {
+                        go(&mut b, s);
+                        go(&mut b, 4 - s);
+                    }
+                }
+                dev.synchronize().unwrap();
+                let (mut w, mut s) = (vec![0u32; n * per(num_cars)], vec![0u32; n]);
+                b.read(&mut w).unwrap();
+                stop.read(&mut s).unwrap();
+                (w, s)
+            };
+            let (whole, _) = run(None, true);
+            assert_eq!(run(None, false).0, whole, "{num_cars} cars: raw controls differ from table rows");
+            assert_eq!(run(Some(1), true).0, whole, "{num_cars} cars: 1 + 3 ticks differ from 4");
+            assert_eq!(run(Some(1), false).0, whole, "{num_cars} cars: 1 + 3 ticks on raw controls differ from 4");
+            eprintln!("{num_cars} cars: {n} arenas, 1 + 3 ticks equal 4 on every word, rows and raw");
+        }
+        // a goal in phase 1 and in phase 2: the ball rolling into the blue goal, as rollout_stops_on_goal
+        let num_cars = 2u32;
+        let mut a = crate::cpu::Arena::new(num_cars);
+        a.kickoff(1);
+        let mut ball = a.ball();
+        ball.body.pos = [0.0, -5000.0, 93.0];
+        ball.body.vel = [0.0, -2000.0, 0.0];
+        ball.sleeping = 0;
+        a.set_ball(&ball);
+        let mut cpu = a.clone();
+        let goal = (1..=120u32).find(|_| {
+            cpu.step(&data, 1);
+            cpu.take_events() & 3 != 0
+        });
+        let goal = goal.expect("the CPU build scores within 120 ticks");
+        let raw = Buffer::from_slice(&dev, &[0f32; 16]).unwrap();
+        let stop = Buffer::from_slice(&dev, &[0u32]).unwrap();
+        for (s, phase) in [(goal, 1), (goal - 1, 2)] {
+            let mut b = GpuBatch::new(&dev, num_cars, a.words()).unwrap();
+            let mut w = [0u32];
+            unsafe { b.rollout_controls_raw(&gdata, s, raw.ptr(), stop.ptr(), 0).unwrap() };
+            dev.synchronize().unwrap();
+            stop.read(&mut w).unwrap();
+            let first = w[0];
+            unsafe { b.rollout_controls_raw(&gdata, 4, raw.ptr(), stop.ptr(), 0).unwrap() };
+            dev.synchronize().unwrap();
+            stop.read(&mut w).unwrap();
+            if phase == 1 {
+                assert_eq!(first, goal | (2 << 16), "phase 1: the first call stops on the goal tick");
+                assert_eq!(w[0], 2 << 16, "phase 1: the second call reports it already stopped");
+            } else {
+                assert_eq!(first, 0xFFFF, "phase 2: no goal in the first call");
+                assert_eq!(w[0], 1 | (2 << 16), "phase 2: the goal on the second call's first tick");
+            }
+        }
+        eprintln!("goal at tick {goal}: stopped in phase 1 and in phase 2");
     }
 
     /// Raw controls: decide with each car's 8 floats equals decide with the same floats as table rows, on every state
@@ -930,7 +1057,7 @@ mod tests {
         };
         let dev = Device::open(0).expect("open device 0");
         let gdata = GpuArenaData::upload(&dev, &data).unwrap();
-        for num_cars in [2u32, 3, 4, 5, 6, 8] {
+        for num_cars in [2u32, 3, 4, 5, 6, 7, 8] {
             let n = 60usize;
             let mut start = parity_arenas(num_cars, n);
             for (i, a) in start.iter_mut().enumerate() {
@@ -964,5 +1091,50 @@ mod tests {
             eprintln!("{num_cars} cars: {bad} of {n} arenas differ {ticks} ticks after a kickoff");
             assert_eq!(bad, 0);
         }
+    }
+
+    /// Replay starts on the card: states built from rows, with controls, step exactly as on the CPU.
+    #[test]
+    fn rows_gpu_equals_cpu_every_word() {
+        let Ok(data) = ArenaData::soccar_from_env() else {
+            eprintln!("no meshes; skipped");
+            return;
+        };
+        let dev = Device::open(0).expect("open device 0");
+        let gdata = GpuArenaData::upload(&dev, &data).unwrap();
+        let n = 256usize;
+        let (ball, pads, cars, team, body) = crate::cpu::tests::sample_rows(n);
+        let prev: Vec<u8> = (0..n * 2).map(|i| (i % 3 == 0) as u8).collect();
+        let built = crate::cpu::states_from_rows(&data, 2, &ball, &pads, &cars, &team, &body, &prev, None);
+        let per = built.len() / n;
+        let mut arenas: Vec<Arena> = built.chunks(per).map(|w| Arena::from_words(2, w)).collect();
+        for (i, a) in arenas.iter_mut().enumerate() {
+            for c in 0..2u32 {
+                let k = i as u32 + c;
+                a.set_controls(
+                    c,
+                    &Controls {
+                        throttle: 1.0,
+                        steer: if k.is_multiple_of(2) { 0.5 } else { -0.5 },
+                        pitch: if k.is_multiple_of(5) { -1.0 } else { 0.0 },
+                        jump: k.is_multiple_of(3) as u32,
+                        boost: k.is_multiple_of(4) as u32,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let words: Vec<u32> = arenas.iter().flat_map(|a| a.words().iter().copied()).collect();
+        let mut batch = GpuBatch::new(&dev, 2, &words).unwrap();
+        let ticks = 240;
+        batch.step(&dev, &gdata, ticks).unwrap();
+        for a in arenas.iter_mut() {
+            a.step(&data, ticks);
+        }
+        let mut got = vec![0u32; words.len()];
+        batch.read(&mut got).unwrap();
+        let bad = arenas.iter().enumerate().filter(|(i, a)| a.words() != &got[i * per..(i + 1) * per]).count();
+        eprintln!("rows: {bad} of {n} arenas differ after {ticks} ticks");
+        assert_eq!(bad, 0);
     }
 }

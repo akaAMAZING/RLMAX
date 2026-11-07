@@ -5,6 +5,7 @@
     for (int o = 0; o < (int)sizeof(s.sweep); o += 128)
         asm volatile("prefetch.global.L2 [%0];" ::"l"(reinterpret_cast<const char*>(&s.sweep) + o));
 #endif
+    if (s.countdown) countdown_hold<NC>(s);  // the round countdown: every car undriven
     const TickConsts k = tick_consts();
     for (int i = 0; i < NC; i++) {
         const uint32_t b = s.cars[i].body, key = b < (uint32_t)NUM_BODY_PRESETS ? b : 0u;

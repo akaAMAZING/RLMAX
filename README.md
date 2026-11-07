@@ -4,12 +4,14 @@ A Rocket League physics simulator for NVIDIA cards: thousands of games at once, 
 
 ## Results
 
-Measured 5 November 2026 on an RTX 5090 (Linux), against RocketGPU 22a1fa7 and RocketSim v3 0.3.5, the latest of each that day.
+Measured 5 November 2026 with release 0.1.1 on an RTX 5090 (Linux), against RocketGPU 22a1fa7 and RocketSim v3 0.3.5, the latest of each that day.
 
 - **Faster in 29 of 31 configurations**: up to 2.0x at large batches. The one loss is 3v3 at 1,024 arenas, by 2.3%.
 - **Less GPU memory in every configuration**: 48% less for 1v1 at 1,024 arenas.
 - **Exact on the strict accuracy suite**: 121 recorded game situations, 12,038,088 bodies stepped from the game's full state, 100% on both the CPU and the card.
 - **More accurate from a public start state**: 90.1% of segments exact, against 81.9% for RocketGPU.
+
+Release 0.1.2 is also exact on the suite's newer version: 144 recordings, 16 of them stepped from controls alone, with the arena running its own boost pads, demolitions, respawns and kickoff countdown. It has not been re-timed on the 5090 yet. On an RTX 3080 at 8,192 arenas it is 1.7% slower than 0.1.1 for 1v1 and 1.9% faster for 3v3.
 
 Speed, millions of arena-ticks per second (higher is better), 8 ticks per decision, median of 3 seeds:
 
@@ -57,7 +59,13 @@ export RLMAX_DATA=~/rlmax-data RLMAX_CUDA_PATH=/usr/local/cuda-13.2
 cargo run --release -p rlmax --example speed
 ```
 
-The first build takes a long time and about 7 GB of RAM at its largest step. The speed test prints millions of arena-ticks per second for 1v1, 3v3 and a mix. Keep the card otherwise idle while it runs. To pick sizes, add them to the command: `-- 1024 8192`.
+The first build takes a long time and about 7 GB of RAM at its largest step. To make it quicker:
+
+- `RLMAX_NVCC_SPLIT=2` compiles more than one kernel at once, in about the same RAM. On a 24-thread desktop with a training run beside it, the full build took 34 minutes this way; 0.1.1 took 61, one kernel at a time. Raise it if you have cores and RAM to spare.
+- `RLMAX_NCS=2` builds only the 1v1 kernels (`2,6` for 1v1 and 3v3). A batch of any other size then fails to load.
+- Compiled kernels are kept in `$RLMAX_DATA/kernel_cache`, so rebuilding the same source, or another project that links RLMAX, reuses them. `RLMAX_KERNEL_CACHE=off` turns it off.
+
+The speed test prints millions of arena-ticks per second for 1v1, 3v3 and a mix. Keep the card otherwise idle while it runs. To pick sizes, add them to the command: `-- 1024 8192`.
 
 ## Check it
 

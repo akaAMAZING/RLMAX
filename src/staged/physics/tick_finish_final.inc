@@ -10,6 +10,7 @@
     bs.vel = bodies[0].vel;
     bs.ang_vel = bodies[0].ang;
     s.tick += 1;
+    if (s.countdown) countdown_advance(s.countdown, s.countdown_count, s.pad_frame_bits);
 
     const float goal_y = (c::GOAL_THRESHOLD_Y_UU + c::BALL_RADIUS_UU) * c::UU_TO_BT;
     if (bs.pos.y > goal_y) s.events |= 1u;   // in orange's goal: blue scored

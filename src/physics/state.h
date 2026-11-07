@@ -119,7 +119,7 @@ template <int NC> using SweepKey = typename SweepKeyType<NC>::type;
 template <int NC>
 constexpr int sweep_cap() {
     // New counts reserve every dynamic-static and dynamic-dynamic pair. Existing counts keep their original capacity.
-    if constexpr (NC == 3 || NC == 5 || NC == 8)
+    if constexpr (NC == 3 || NC == 5 || NC == 7 || NC == 8)
         return (NC + 1) * 22 + NC * (NC + 1) / 2;
     else return 12 + 4 * NC;
 }
@@ -144,9 +144,10 @@ constexpr int NUM_PADS = 34;
 
 // The car visited k-th (the game's vehicle order: pre-ticks, vehicle updates, pickups). Slot k of ArenaState::visit holds
 // slot ^ k, so a state that was never reordered is zero and the usual order, ascending, costs one xor.
-// Eight cars use three bits per slot to leave the high byte for the absent mask.
+// Seven and eight cars use three bits per slot to leave the high byte for the absent mask (seven nibbles would reach bit 27).
+template <int NC> RLMAX_HD constexpr int visit_bits() { return NC >= 7 ? 3 : 4; }
 template <int NC> RLMAX_HD int visit_slot(uint32_t visit, int k) {
-    constexpr int bits = NC == 8 ? 3 : 4;
+    constexpr int bits = visit_bits<NC>();
     return (int)(((visit >> (bits * k)) & ((1u << bits) - 1)) ^ (uint32_t)k);
 }
 
@@ -166,6 +167,8 @@ struct ArenaState {
     uint32_t events;  // bit 0 blue scored, bit 1 orange scored; cleared by the host per decision
     uint32_t fault;   // non-finite state detected (DESIGN §14)
     uint32_t seed_mask;  // pending basis and inverse-valid: 9 bits each
+    uint32_t countdown;  // the round countdown (countdown.h): bits 0..1 phase (0 none, 1 first second, 2 three fires), bits 2..3 fires so far
+    float countdown_count;  // the countdown's seconds counter; zero when no countdown runs
     SweepState<NC> sweep;  // the order of the solver's manifolds (sweep.h)
     // Cold upload data, carried by arena words; body 0 is the ball, then the cars.
     M3 seed_basis[NC + 1];
